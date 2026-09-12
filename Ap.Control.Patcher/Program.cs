@@ -7,7 +7,11 @@ namespace Ap.Control.Patcher
     /// </summary>
     internal static class Program
     {
-        private const string GameProcess = "Control_DX12";
+        /// <summary>
+        /// The running game, as the process list names it: Control_DX12.exe on Windows, and the
+        /// bundle's CFBundleExecutable — plain "Game" — on macOS.
+        /// </summary>
+        private static readonly string GameProcess = OperatingSystem.IsMacOS() ? "Game" : "Control_DX12";
 
         private static int Main(string[] args)
         {
@@ -25,7 +29,10 @@ namespace Ap.Control.Patcher
             {
                 Console.Error.WriteLine(
                     "error: access denied writing to the game folder.\n" +
-                    "Close Steam and the game, or run this from an elevated prompt.");
+                    (OperatingSystem.IsMacOS()
+                        ? "Close Steam and the game. If it persists, check that your user owns the\n" +
+                          "Steam library folder — a library on an external disk is often read-only."
+                        : "Close Steam and the game, or run this from an elevated prompt."));
                 return 1;
             }
         }
@@ -86,25 +93,22 @@ namespace Ap.Control.Patcher
             return worst;
         }
 
-        private static (PackFile.Entry Entry, string Rmdp, byte[] Blob) Load(PatchDef patch, string game)
+        private static (PackFile.Located Pack, byte[] Blob) Load(PatchDef patch, string game)
         {
-            string baseName = Path.Combine(game, "data_packfiles", patch.Package);
-            string bin = baseName + ".bin", rmdp = baseName + ".rmdp";
-            if (!File.Exists(bin) || !File.Exists(rmdp))
-                throw new PatchException($"package not found: {baseName}.bin / .rmdp");
-
-            var entry = PackFile.FindEntry(bin, patch.Target);
-            return (entry, rmdp, PackFile.ReadBlob(rmdp, entry));
+            PackFile.Located pack = PackFile.Locate(
+                Path.Combine(game, "data_packfiles"), patch.Package, patch.Target);
+            return (pack, PackFile.ReadBlob(pack.Rmdp, pack.Entry));
         }
 
         private static int Status(PatchDef patch, string game, BackupStore store)
         {
-            var (entry, rmdp, blob) = Load(patch, game);
+            var (pack, blob) = Load(patch, game);
+            PackFile.Entry entry = pack.Entry;
 
-            Console.WriteLine($"target    : {patch.Target} in {patch.Package}");
+            Console.WriteLine($"target    : {patch.Target} in {Path.GetFileName(pack.Bin)}");
             Console.WriteLine($"content   : offset 0x{entry.Offset:X}  length {entry.Length}");
             Console.WriteLine($"sha1      : {BackupStore.Sha1(blob)}");
-            Console.WriteLine($"rmdp size : {new FileInfo(rmdp).Length:N0}");
+            Console.WriteLine($"rmdp size : {new FileInfo(pack.Rmdp).Length:N0}");
             Console.WriteLine($"state     : {Describe(patch.StateOf(blob))}");
 
             if (store.Has(patch) && store.ReadManifest(patch) is { } m)
@@ -130,7 +134,8 @@ namespace Ap.Control.Patcher
 
         private static int Apply(PatchDef patch, string game, BackupStore store, bool dryRun, string? cliOut)
         {
-            var (entry, rmdp, blob) = Load(patch, game);
+            var (pack, blob) = Load(patch, game);
+            (string rmdp, PackFile.Entry entry) = (pack.Rmdp, pack.Entry);
 
             if (patch.StateOf(blob) == PatchState.Patched)
             {
@@ -158,7 +163,7 @@ namespace Ap.Control.Patcher
 
             if (GameIsRunning())
                 throw new PatchException(
-                    $"{GameProcess}.exe is running — close the game (and Steam, which also locks the "
+                    $"{GameProcess} is running — close the game (and Steam, which also locks the "
                     + "archive) before patching.");
 
             if (store.Save(patch, blob, patched, entry))
@@ -174,7 +179,7 @@ namespace Ap.Control.Patcher
 
         private static int Verify(PatchDef patch, string game)
         {
-            var (entry, _, blob) = Load(patch, game);
+            var (pack, blob) = Load(patch, game);
 
             string[] missing = [.. patch.Edits.Where(e => Bytes.Count(blob, e.New) != 1).Select(e => e.Label)];
             if (missing.Length > 0)
@@ -182,7 +187,7 @@ namespace Ap.Control.Patcher
                 Console.WriteLine($"NOT patched (missing: {string.Join(", ", missing)})");
                 return 1;
             }
-            Console.WriteLine($"verified: all {patch.Edits.Count} edit(s) present, length {entry.Length} (unchanged)");
+            Console.WriteLine($"verified: all {patch.Edits.Count} edit(s) present, length {pack.Entry.Length} (unchanged)");
             return 0;
         }
 
@@ -196,9 +201,10 @@ namespace Ap.Control.Patcher
 
             if (GameIsRunning())
                 throw new PatchException(
-                    $"{GameProcess}.exe is running — close the game (and Steam) before restoring.");
+                    $"{GameProcess} is running — close the game (and Steam) before restoring.");
 
-            var (entry, rmdp, _) = Load(patch, game);
+            var (pack, _) = Load(patch, game);
+            (string rmdp, PackFile.Entry entry) = (pack.Rmdp, pack.Entry);
             if (entry.Offset != m.Offset || entry.Length != m.Length)
                 throw new PatchException(
                     "the package index no longer matches the backup (offset/length changed — game "
@@ -272,8 +278,11 @@ namespace Ap.Control.Patcher
                   all       Every gameplay patch (default)
 
                 OPTIONS
-                  --game <path>        Control install folder (auto-detected if omitted)
-                  --backup-dir <path>  Where originals are kept (default: LocalAppData\\Ap.Control)
+                  --game <path>        Control install folder (auto-detected if omitted). On macOS,
+                                       the Steam "Control" folder, Game.app, or Game.app/Contents/
+                                       Resources all work
+                  --backup-dir <path>  Where originals are kept (default: Ap.Control in the user's
+                                       local application data)
                   --dry-run            Show what apply would do, leave the game untouched
                   --out <path>         With --dry-run, save the patched content for inspection
 

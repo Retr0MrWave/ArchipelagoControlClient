@@ -2,9 +2,12 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <!-- Windows-specific: it patches a Windows game install and reads Steam's registry keys to find
-         it. net10.0-windows gets the registry APIs in-box rather than via a package reference. -->
-    <TargetFramework>net10.0-windows</TargetFramework>
+    <!-- Plain net10.0, NOT net10.0-windows: the same tool patches the macOS install, where the game
+         ships as Game.app. Microsoft.Win32.Registry is part of the net10.0 shared framework (its
+         members are simply annotated [SupportedOSPlatform("windows")]), so dropping the -windows TFM
+         costs nothing but obliges every registry call to sit behind an OperatingSystem.IsWindows()
+         guard to satisfy CA1416. -->
+    <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>Ap.Control.Patcher</AssemblyName>
@@ -15,8 +18,17 @@
     <!-- RID and SelfContained are UNCONDITIONAL, not Release-only. Both affect the restore graph, and
          a plain `dotnet restore` evaluates Debug: if they only applied to Release, restore would write
          a lock file with no RID and a Release publish would then disagree with it (NU1004 in locked
-         mode). Keep them out of any Configuration condition. -->
-    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+         mode). Keep them out of any Configuration condition.
+
+         RuntimeIdentifiers (plural) is the SET the lock file is written for, and it is deliberately
+         host-independent: restoring on Windows and on macOS must compute the same targets, or one of
+         them fails locked-mode restore. RuntimeIdentifier (singular) only chooses which member of
+         that set this build produces - SelfContained needs exactly one - and defaults to the host's,
+         so `dotnet build` does the obvious thing on either machine. Passing -r on the command line
+         overrides it without touching the set. -->
+    <RuntimeIdentifiers>win-x64;osx-arm64</RuntimeIdentifiers>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == '' and $([MSBuild]::IsOSPlatform('OSX'))">osx-arm64</RuntimeIdentifier>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
     <!-- Self-contained to match the client. The client now bundles the runtime, so a player may have
          no .NET installed at all — a framework-dependent patcher would fail to start for exactly the
          players the self-contained client exists to serve. -->
@@ -30,9 +42,9 @@
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
   </PropertyGroup>
 
-  <!-- `dotnet publish -c Release` produces ONE .exe the player can drop next to the client and run.
-       Bundling the runtime makes it ~70 MB rather than ~215 KB, which is the price of not requiring
-       a .NET install.
+  <!-- `dotnet publish -c Release` produces ONE executable the player can drop next to the client and
+       run. Bundling the runtime makes it ~70 MB rather than ~215 KB, which is the price of not
+       requiring a .NET install.
 
        The runtime packs this pulls from NuGet are blocked by the user-level packageSourceMapping
        allow-list — see the repo-root nuget.config, which exists to let them through. -->
