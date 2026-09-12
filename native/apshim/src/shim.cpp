@@ -6,6 +6,7 @@
 #include <mutex>
 #include <string>
 
+#include "ipc.h"
 #include "log.h"
 #include "mainthread.h"
 
@@ -47,6 +48,11 @@ __attribute__((constructor)) static void ap_shim_init() {
         ap::logf("---- Ap.Control shim loaded ----");
         ap::logf("executable : %s", executable_path().c_str());
         ap::logf("pump       : %p (%s)", pump, kPumpSymbol);
+
+        // Only the socket is set up here. Nothing calls into the engine yet: dyld has loaded the
+        // images but the game's own initialisers have not run, so anything the engine owns is not
+        // there to be touched.
+        ap::ipc::start();
         ap::logf("waiting for the first frame; the interposer announces itself when it ticks");
     });
 }

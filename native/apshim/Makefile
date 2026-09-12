@@ -50,6 +50,7 @@ $(OUT) $(OUT)/obj:
 
 FAKECORE := $(OUT)/libfakecore.dylib
 FAKEGAME := $(OUT)/fakegame
+CHECKCLI := $(OUT)/checkclient
 
 $(FAKECORE): test/fakecore.cpp | $(OUT)
 	$(CXX) $(COMMON) -O0 -g -dynamiclib -install_name @rpath/libfakecore.dylib -o $@ $<
@@ -57,7 +58,10 @@ $(FAKECORE): test/fakecore.cpp | $(OUT)
 $(FAKEGAME): test/fakegame.cpp $(FAKECORE)
 	$(CXX) $(COMMON) -O0 -g -o $@ $< -L$(OUT) -lfakecore -Wl,-rpath,@executable_path
 
-check: $(DYLIB) $(FAKEGAME)
+$(CHECKCLI): test/checkclient.cpp | $(OUT)
+	$(CXX) $(COMMON) -O0 -g -o $@ $<
+
+check: $(DYLIB) $(FAKEGAME) $(CHECKCLI)
 	@./test/run-check.sh "$(OUT)"
 
 # --- install ---------------------------------------------------------------------------------

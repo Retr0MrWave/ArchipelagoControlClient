@@ -1,10 +1,10 @@
 #!/bin/sh
 #
-# Proves the shim's interposers are wired up and actually fire, without needing Control installed.
+# Proves the shim works, without needing Control installed.
 #
-# Worth having because the failure mode is silent. A dylib whose __interpose section got dropped,
-# or whose asm label names a symbol nothing binds, loads perfectly happily and simply never runs -
-# which in the real game is indistinguishable from "the player is sitting at a menu".
+# Worth having because every failure mode here is silent. A dylib whose __interpose section got
+# dropped, or whose asm label names a symbol nothing binds, loads perfectly happily and simply
+# never runs - which in the real game is indistinguishable from "the player is at a menu".
 
 set -eu
 
@@ -12,44 +12,77 @@ OUT=$(cd "${1:-out}" && pwd)
 SHIM="$OUT/libapcontrol.dylib"
 CORE="$OUT/libfakecore.dylib"
 GAME="$OUT/fakegame"
-LOG=$(mktemp -t apshim-check)
-FRAMES=120
+CLIENT="$OUT/checkclient"
 
-# The engine symbols, exactly as `nm` prints them. Spelled out here rather than derived so that a
-# typo in the shim's asm labels is caught by a failing test and not by a puzzled player.
+WORK=$(mktemp -d -t apshim-check)
+LOG="$WORK/shim.log"
+SOCK="$WORK/shim.sock"
+RUNTIME_MS=4000
+
+# The engine symbols, exactly as `nm` prints them. Spelled out here rather than derived, so a typo
+# in the shim's asm labels is caught by a failing test and not by a puzzled player.
 PUMP='__ZN8coregame20DynamicEntitySpawner6updateEv'
 SAVE='__ZN8coregame10GameHelper8saveGameEN3net11NetworkRoleEbb'
+
+game_pid=''
+
+cleanup() {
+	[ -n "$game_pid" ] && kill "$game_pid" 2>/dev/null || true
+	rm -rf "$WORK"
+}
+trap cleanup EXIT
 
 fail() {
 	echo "FAIL: $*" >&2
 	echo "--- shim log ---" >&2
-	cat "$LOG" >&2 || true
-	rm -f "$LOG"
+	cat "$LOG" >&2 2>/dev/null || echo "(no log)" >&2
 	exit 1
 }
 
-# 1. The shim must reference the engine symbols, and the stand-in must export the same names. If
-#    these ever disagree the shim is interposing something that does not exist.
+# --- static wiring ---------------------------------------------------------------------------
+
 for sym in "$PUMP" "$SAVE"; do
 	nm -u "$SHIM" | grep -qx "$sym" || fail "the shim does not import $sym"
 	nm -gU "$CORE" | grep -q "[[:space:]]$sym\$" || fail "the stand-in does not export $sym"
 done
-
-# 2. The section itself must survive the link. Dead-stripping it is the classic way this breaks.
 otool -l "$SHIM" | grep -q '__interpose' || fail "the shim has no __DATA,__interpose section"
+echo "  ok   interpose section present and bound to the engine symbols"
 
-# 3. Run the stand-in game with the shim inserted, the same way the launch wrapper will.
-output=$(AP_SHIM_LOG="$LOG" DYLD_INSERT_LIBRARIES="$SHIM" "$GAME") || fail "the stand-in game exited non-zero"
+# --- live run --------------------------------------------------------------------------------
 
-# 4. Our code ran...
-grep -q 'Ap.Control shim loaded' "$LOG" || fail "the shim's constructor did not run"
+AP_SHIM_LOG="$LOG" AP_SHIM_SOCKET="$SOCK" DYLD_INSERT_LIBRARIES="$SHIM" \
+	"$GAME" "$RUNTIME_MS" >"$WORK/game.out" 2>"$WORK/game.err" &
+game_pid=$!
+
+# Wait for the shim to bind. If it never does, the constructor did not run.
+waited=0
+while [ ! -S "$SOCK" ]; do
+	waited=$((waited + 1))
+	[ "$waited" -gt 100 ] && fail "the shim never created its socket at $SOCK"
+	sleep 0.05
+done
+echo "  ok   shim bound its socket"
+
+"$CLIENT" "$SOCK" || fail "the protocol test reported failures"
+
+wait "$game_pid"
+game_pid=''
+output=$(cat "$WORK/game.out")
+
+# --- the interposers fired, and chained --------------------------------------------------------
+
 grep -q 'pump interposer live' "$LOG" || fail "the pump interposer never fired"
 grep -q 'event: save_game' "$LOG" || fail "the saveGame interposer never fired"
 
-# 5. ...and so did the original. An interposer that forgot to chain would leave these at zero while
-#    everything above still passed.
-echo "$output" | grep -q "updates=$FRAMES" || fail "the original pump did not run every frame ($output)"
-echo "$output" | grep -q 'saves=1' || fail "the original saveGame did not run ($output)"
+frames=$(echo "$output" | sed -n 's/.*frames=\([0-9]*\).*/\1/p')
+updates=$(echo "$output" | sed -n 's/.*updates=\([0-9]*\).*/\1/p')
+saves=$(echo "$output" | sed -n 's/.*saves=\([0-9]*\).*/\1/p')
 
-rm -f "$LOG"
-echo "ok: interposers wired, fired, and chained to the originals ($output)"
+[ -n "$frames" ] && [ "$frames" -gt 0 ] || fail "the stand-in game ran no frames ($output)"
+# The point of this one: an interposer that replaced the engine's function instead of chaining to
+# it would pass every check above while breaking the game.
+[ "$frames" = "$updates" ] || fail "the original pump did not run every frame ($output)"
+[ "$saves" = "1" ] || fail "the original saveGame did not run ($output)"
+echo "  ok   originals still ran ($output)"
+
+echo "ok: shim loads, interposes, chains, and serves the full protocol"
