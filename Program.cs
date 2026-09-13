@@ -10,6 +10,7 @@ using Ap.Control.Utils.Save;
 
 if (args.Length > 0 && args[0] == "dump-save") return DumpSave(args);
 if (args.Length > 0 && args[0] == "probe-game") return ProbeGame(args);
+if (args.Length > 0 && args[0] == "try-unlock") return TryUnlock(args);
 
 return await RunClientAsync(args);
 
@@ -32,7 +33,8 @@ static async Task<int> RunClientAsync(string[] args)
             "                  [--source memory|file] [--save <path>] [--items <apitems.json>]\n" +
             "                  [--ui-port <n>] [--no-ui]\n" +
             "       Ap.Control dump-save [<path>]\n" +
-            "       Ap.Control probe-game [--layout [<rtti-name>]] [--snapshot <path>]\n\n" +
+            "       Ap.Control probe-game [--layout [<rtti-name>]] [--snapshot <path>]\n" +
+            "       Ap.Control try-unlock weapon-slot | mod-slot [<0-3>]\n\n" +
             "With --server and --username the client connects on startup as before. Without them it\n" +
             "waits for the in-game Archipelago page to supply the details.\n\n" +
             "dump-save parses a save and prints the location checks it would report, without\n" +
@@ -42,7 +44,10 @@ static async Task<int> RunClientAsync(string[] args)
             "the instances in memory say about where the class keeps its fields, for when the scan\n" +
             "finds objects but none of them the player's. --snapshot records the player's object and,\n" +
             "on a later run, reports what changed — which is how to find a field that has no shape of\n" +
-            "its own, like an item count. macOS only.");
+            "its own, like an item count. macOS only.\n\n" +
+            "try-unlock calls one of the milestone functions in the running game, to confirm the\n" +
+            "address found by reading the binary is the function it looks like. It changes your\n" +
+            "game; nothing is saved unless you save. macOS only.");
         return 0;
     }
 
@@ -261,6 +266,114 @@ static int DumpSave(string[] args)
               + diff.NewUnlockedControlPoints.Count + diff.NewCollectibles.Count + completed.Length;
     Console.WriteLine($"\n{total} check(s) would be sent. Whether the server accepts each one "
         + "depends on the generated world having that location id.");
+    return 0;
+}
+
+/// <summary>
+/// Call one of the milestone methods in the running game, to find out whether the address found by
+/// reading the binary is the function it looks like.
+///
+/// This changes the player's game, which is the point — there is no way to confirm a function does
+/// what the disassembly says other than running it and looking. So it does everything it can before
+/// it commits: the object has to carry the right vtable, found by name rather than by address; the
+/// pump has to be ticking, since a call queued against a paused game only waits; and it says what
+/// it is about to do, with the address, before doing it.
+///
+/// Deliberately not part of the granter path. When these addresses are confirmed the granters will
+/// call them for real, and this stays as the way to answer "is this still the right address?" after
+/// a game update.
+/// </summary>
+static int TryUnlock(string[] args)
+{
+    string? what = args.Skip(1).FirstOrDefault(a => !a.StartsWith("--", StringComparison.Ordinal));
+    if (!OperatingSystem.IsMacOS() || what is null or not ("weapon-slot" or "mod-slot"))
+    {
+        Console.Error.WriteLine(OperatingSystem.IsMacOS()
+            ? "Usage: Ap.Control try-unlock weapon-slot | mod-slot [<0-3>]"
+            : "try-unlock drives the macOS helper dylib; this platform drives the game directly.");
+        return 1;
+    }
+
+    int slot = 0;
+    if (what == "mod-slot")
+    {
+        string? given = args.Skip(2).FirstOrDefault(a => !a.StartsWith("--", StringComparison.Ordinal));
+        if (given is not null && (!int.TryParse(given, out slot) || slot is < 0 or > 3))
+        {
+            Console.Error.WriteLine($"try-unlock: the mod slot must be 0 to 3, got '{given}'");
+            return 1;
+        }
+    }
+
+    using var shim = new ShimClient();
+    if (!shim.EnsureConnected() || shim.Hello() is not { } hello)
+    {
+        Console.Error.WriteLine($"try-unlock: nothing is listening on {shim.SocketPath}.");
+        return 1;
+    }
+
+    if (MacGameBuildRegistry.Resolve(hello) is not { } profile)
+    {
+        Console.Error.WriteLine("try-unlock: this build is not in the client's profile list, so "
+            + "there are no addresses to try.");
+        return 1;
+    }
+    if (hello.Executable is not { } game)
+    {
+        Console.Error.WriteLine("try-unlock: the Game image has no load address.");
+        return 1;
+    }
+
+    Console.WriteLine($"Build:  {profile.Name}");
+
+    MacPlayerProperties.Located found =
+        new MacPlayerProperties(shim).Locate(profile, game.Base, profile.Inventory);
+    if (found.Problem is { } problem)
+    {
+        Console.Error.WriteLine($"try-unlock: {problem}");
+        return 1;
+    }
+
+    Console.WriteLine($"Object: 0x{found.Address:x} — {MacPlayerProperties.RttiName}, "
+        + $"vtable confirmed, network role {found.Role}");
+
+    // A call queued against a game that is not running frames simply waits for its timeout, which
+    // reads as "the address is wrong" when it means "the game is at a menu".
+    if (!hello.PumpTicking)
+    {
+        Console.Error.WriteLine("try-unlock: the pump is not ticking — the game is at a menu or "
+            + "paused. Get into gameplay and run this again.");
+        return 1;
+    }
+
+    (long offset, string name, ulong[] arguments) = what == "weapon-slot"
+        ? (profile.UnlockSecondaryWeaponSlot, "UnlockSecondaryWeaponSlot",
+            new[] { (ulong)found.Address })
+        : (profile.UnlockCharacterModSlot, "UnlockCharacterModSlot",
+            new[] { (ulong)found.Address, (ulong)slot });
+
+    if (offset == 0)
+    {
+        Console.Error.WriteLine($"try-unlock: {name} is not mapped for this build.");
+        return 1;
+    }
+
+    ulong function = game.Base + (ulong)offset;
+    Console.WriteLine($"Calling {name}(0x{found.Address:x}"
+        + (what == "mod-slot" ? $", {slot}" : "") + $") at Game+0x{offset:x} = 0x{function:x}");
+
+    ShimCall result = shim.Call(function, arguments, []);
+    if (!result.Ok)
+    {
+        Console.Error.WriteLine($"try-unlock: the call did not complete — {result.Error}");
+        return 1;
+    }
+
+    Console.WriteLine($"  returned 0x{result.Result:x} after {result.Beats} pump beat(s)");
+    Console.WriteLine();
+    Console.WriteLine("The game is still running, so look now: open the loadout or Abilities screen");
+    Console.WriteLine("and see whether the slot appeared. Nothing has been saved — save in game if");
+    Console.WriteLine("you want it kept, or reload to discard it.");
     return 0;
 }
 
