@@ -132,18 +132,29 @@ namespace Ap.Control.Memory.Mac
 
                 // The other shape: a container's end pointer stepping forward by one element while
                 // its start stays where it was.
-                if (note.Length == 0 && offset % 8 == 0 && offset + 8 <= window)
+                //
+                // "Start stays put" is far too weak on its own — a pointer into the image never
+                // moves, so any word following one satisfies it. The first attempt at this rule
+                // announced a container at +0xf8 whose start was a vtable pointer and whose span
+                // came to 28 GB. So the pair has to look like a container as well as behave like
+                // one: both ends on the heap, spanning a sane distance, and that distance a whole
+                // number of the elements it just grew by.
+                if (note.Length == 0 && offset >= 8 && offset % 8 == 0 && offset + 8 <= window)
                 {
                     ulong wasWide = BitConverter.ToUInt64(before.Window, offset);
                     ulong nowWide = BitConverter.ToUInt64(after.Window, offset);
-                    bool startHeld = offset >= 8
-                        && BitConverter.ToUInt64(before.Window, offset - 8)
-                           == BitConverter.ToUInt64(after.Window, offset - 8);
+                    ulong start = BitConverter.ToUInt64(before.Window, offset - 8);
+                    bool startHeld = start == BitConverter.ToUInt64(after.Window, offset - 8);
 
-                    if (startHeld && nowWide > wasWide && nowWide - wasWide <= 4096
-                        && PointerRange.MacOS.Contains(wasWide))
-                        note = $"advanced {nowWide - wasWide} bytes with +0x{offset - 8:x} unmoved — "
-                             + "this is the shape a container's end has";
+                    ulong step = nowWide > wasWide ? nowWide - wasWide : 0;
+                    if (startHeld && step is > 0 and <= 4096
+                        && PointerRange.MacOS.Contains(start)
+                        && PointerRange.MacOS.Contains(wasWide)
+                        && wasWide >= start && wasWide - start <= 16u << 20
+                        && (wasWide - start) % step == 0)
+                        note = $"advanced {step} bytes past +0x{offset - 8:x}, which held still and "
+                             + $"is {(wasWide - start) / step} elements behind — this is the shape a "
+                             + "container's end has";
                 }
 
                 changes.Add(new Change(offset, was, now, note));
