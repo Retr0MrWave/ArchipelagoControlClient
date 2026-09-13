@@ -99,10 +99,10 @@ Written for someone who has not been here before. Everything is current as of th
 |---|---|---|
 | Xcode Command Line Tools | `clang++` builds the shim; `xcrun llvm-objdump` reads the game binary | |
 | .NET SDK 10 | client and patcher | |
-| Ghidra | reading a handful of functions out; `macho.py` answers everything that is a pattern rather than data flow | `brew install ghidra`. It pulls `openjdk@21`, which Homebrew keeps keg-only, so **every** headless invocation needs `JAVA_HOME` set — see `tools/README.md` |
+| Ghidra | reading a handful of functions out; `macho.py` answers everything that is a pattern rather than data flow | `brew install ghidra`. It pulls `openjdk@21`, which Homebrew keeps keg-only, so **every** headless invocation needs `JAVA_HOME` set — see `native/re/README.md` |
 | Control, Steam macOS 1.34 | every address in the profile is for this build only | `Game` LC_UUID `CF65DC88-F5CE-38A4-8A2A-21FD5F43F14B` |
 
-`tools/macho.py` needs Python 3 and no packages.
+`native/re/macho.py` needs Python 3 and no packages.
 
 ### The loop
 
@@ -148,8 +148,8 @@ calling it in a live game, and the profile has no zeroes. What is left is **Phas
 
 - The Ghidra project lives wherever you put it and is not in the repo. Re-importing `Game` takes
   about five minutes and 250 MB; put it somewhere that survives the session (`~/ghidra-projects`
-  is what `tools/README.md` uses).
-- Every address in the profile moves when the game updates. `tools/` exists so re-deriving them is
+  is what `native/re/README.md` uses).
+- Every address in the profile moves when the game updates. `native/re/` exists so re-deriving them is
   a repeatable procedure rather than a fresh investigation — §4.3 records how each was found, not
   just what it is. Two routes cover all four: the RPC dispatcher's inline name comparisons, and the
   script-binder instantiations, whose RTTI names carry each bound method's full C++ signature.
@@ -435,7 +435,7 @@ intact (Ghidra's "RTTI Analyzer" / class recovery names the vtables for you).
 **C. Milestones (weapon slot + 2 mod slots) — FOUND**
 - There is no name-to-function table. The RPC dispatcher compares an incoming method name against
   each name it knows and calls the handler inline, so the names are referenced from code, not data.
-  `tools/macho.py`'s `refs_to()` gives the comparison site directly:
+  `native/re/macho.py`'s `refs_to()` gives the comparison site directly:
   `UnlockSecondaryWeaponSlot` → `0x100987f30`, `UnlockCharacterModSlot` → `0x100987f80`. The two are
   0x50 apart in the same chain, as the plan guessed.
 - Reading each site out gives the handler and how it is called:
@@ -563,7 +563,7 @@ are none left.
 Everything symbol- or RTTI-derived is deliberately **not** in the record — the frame pump, `saveGame`,
 the object manager, the flow-connection singleton, and every vtable the scans need. Those are
 resolved at runtime by name and survive a game update untouched. What is in the record is exactly
-what a game update invalidates, which is the list to re-derive with `tools/` when one lands, and
+what a game update invalidates, which is the list to re-derive with `native/re/` when one lands, and
 §4.3 records how each was found rather than only what it is.
 
 `InventoryLayout` is in the record but defaulted rather than per-build, because the checks in §4.4
@@ -843,7 +843,7 @@ Ap.Control try-unlock weapon-slot                     # call a mapped address fo
 Ap.Control try-unlock item 0x<gid>                    # ... including the two not yet confirmed in game
 ```
 
-Reading the binary (`tools/README.md` has the rest):
+Reading the binary (`native/re/README.md` has the rest):
 
 ```
 cd tools && python3 -i macho.py
