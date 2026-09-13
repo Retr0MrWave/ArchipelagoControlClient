@@ -42,8 +42,8 @@ Phases 0, 1 and 2 are built and on the `macos-port` branch. What runs today:
   state (clearance, sector flags) through the shim.
 - **Object discovery** needs no per-build address: the `vtable` op walks the binary's RTTI, and
   `MacPlayerInventory` sweeps the heap for the player's inventory and picks the authoritative
-  replica. `Ap.Control probe-game` prints each step of that, which is how it is confirmed against a
-  live game.
+  replica. Confirmed against the running game — 46 inventory objects, two of them the player's,
+  roles 3 and 2, re-found after a reload. `Ap.Control probe-game` prints each step.
 - **Not yet**: inventory items and ability upgrades, which need §4.3's reverse engineering. The
   profile holds zeroes rather than guesses and the granters say which feature is unmapped.
 
@@ -306,6 +306,24 @@ checks: network-role top bits ∈ {2,3} on the inventory candidates, item count 
 save's inventory size, `type ≤ 2` on GameFlow nodes, archetype GID low 14 bits == 77 on upgrade
 entities. Put the confirmed values in the macOS profile record, not in constants.
 
+**Measured, and they do differ** — "usually lays these out identically" did not survive contact with
+`GameInventoryComponentState`. The GameFlow node layout transferred intact, but this class did not:
+
+| Field | Windows | macOS 1.34 | How |
+|---|---|---|---|
+| player flag | `0x90` | **`0x45`** | the only bytes set on exactly two objects out of 46 — the two replicas. `0x55`, `0x60` and `0x88` behave identically; which one *means* "is the player" wants a disassembler |
+| network role | `0x18` | **`0x10`** | the only word in the first 0x200 bytes whose top two bits read 2 or 3 on every instance, with both roles present |
+| item count | `0x48` | **unmapped** | at `0x48` the two replicas disagree and read ≈3.9 billion — the low half of a pointer. A count has no shape of its own, so it is left unmapped rather than guessed; nothing depends on it |
+
+Note this is not a uniform shift, so the rest of the class cannot be derived by subtracting 8.
+
+`Ap.Control probe-game --layout [<rtti-name>]` is what produced that table and takes any class, so
+the same method applies to `MGR_OFF_*` on `PlayerPropertiesComponentState` in Phase 3. It compares
+every instance in memory and reports three things: bytes that single out a few objects (flags), words
+whose top two bits read as a network role, and words the player's replicas agree on that are small
+enough to be a count. Objects that stopped carrying the vtable pointer between the sweep and the read
+are dropped — one freed and reused in that gap differs at nearly every offset and buries the signal.
+
 ### 4.5 Profile record (proposal)
 
 ```
@@ -521,7 +539,7 @@ signature hunting).
 | Steam changes what `%command%` passes to the wrapper (`.app` vs binary) or stops exporting `STEAM_DYLD_INSERT_LIBRARIES` | Wrapper handles both shapes; overlay loss is cosmetic. Client-launch (§5.2) remains as a second path. |
 | Interposing does not bind for a non-libSystem symbol in some dyld version | §3.2 fallbacks (GOT slot rebind); verified cheaply in Phase 0. |
 | Pump does not tick in menus/pause | Identical to Windows; deferred-grant queue already exists; the `pump_state` event lets the UI say "load a save". |
-| clang struct layouts differ from MSVC for one of the touched classes | §4.4 confirmation checks before any write; values live in the profile, not constants. |
+| ~~clang struct layouts differ from MSVC for one of the touched classes~~ **happened** | Two of `GameInventoryComponentState`'s three fields moved (§4.4). Caught by the confirmation checks rather than by a bad write, and fixed as data. The remaining classes should be assumed to have moved too until measured. |
 | Game update ships a new `Game` (new UUID) | dlsym/RTTI parts keep working; only the residual `Game` offsets need re-deriving (one Ghidra session, and the recipes in §4.3 are repeatable). |
 | Save location/container unknown until a save exists; could be Cloud-only or container-wrapped | §7: signature search inside the file; in-process scan fallback via the shim. |
 | Gatekeeper refuses the dylib or the client binary | Embed + write + clear quarantine; ship `.tar.gz`; document `xattr -d`. |

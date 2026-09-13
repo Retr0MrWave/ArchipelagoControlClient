@@ -19,8 +19,11 @@ namespace Ap.Control.Memory.Mac
         /// <summary>The class, as the Itanium ABI names it in the binary.</summary>
         internal const string RttiName = "27GameInventoryComponentState";
 
-        /// <summary>One player-flagged inventory object, with the fields used to rank it.</summary>
-        internal readonly record struct Candidate(long Address, int Role, uint Items);
+        /// <summary>
+        /// One player-flagged inventory object, with the fields used to rank it.
+        /// <paramref name="Items"/> is null where the build does not map an item count.
+        /// </summary>
+        internal readonly record struct Candidate(long Address, int Role, uint? Items);
 
         /// <summary>What a sweep saw, kept whole so the diagnostics can explain an empty result.</summary>
         internal readonly record struct Survey(
@@ -77,10 +80,18 @@ namespace Ap.Control.Memory.Mac
 
             var candidates = new List<Candidate>();
             int playerFlagged = 0;
+            int vanished = 0;
             foreach (long address in instances)
             {
                 byte[] window = _shim.Read(address, fields.WindowSize);
                 if (window.Length < fields.WindowSize) continue;
+
+                // The sweep and this read are separate round trips, and the game allocates between
+                // them. An object freed and its memory reused in that gap is no longer the object
+                // that was found, so check the vtable pointer is still there before reading fields
+                // out of it by offset.
+                if (BitConverter.ToUInt64(window, 0) != primary.Address) { vanished++; continue; }
+
                 if (window[fields.IsPlayer] != 1) continue;
 
                 playerFlagged++;
@@ -92,13 +103,17 @@ namespace Ap.Control.Memory.Mac
                 if (role is not (2 or 3)) continue;
 
                 candidates.Add(new Candidate(address, role,
-                    BitConverter.ToUInt32(window, fields.ItemCount)));
+                    fields.ItemCount > 0 ? BitConverter.ToUInt32(window, fields.ItemCount) : null));
             }
 
             string? problem = null;
             if (playerFlagged == 0)
+                // Worth being careful about which way to point here. Finding no objects at all
+                // means no save is loaded; finding fifty and none of them the player's means the
+                // flag is not where this layout says it is, because a loaded game always has one.
                 problem = $"{instances.Length} inventory object(s) in memory, none flagged as the "
-                        + "player's — is a save loaded?";
+                        + $"player's at +0x{fields.IsPlayer:x}. If a save is loaded, this build "
+                        + "puts that flag somewhere else — run probe-game --layout to find it.";
             else if (candidates.Count == 0)
                 problem = $"{playerFlagged} player inventory object(s) found, but none carries a "
                         + $"network role at +0x{fields.NetRole:x}. This build lays "
@@ -107,13 +122,18 @@ namespace Ap.Control.Memory.Mac
 
             long chosen = Choose(candidates);
             _found = chosen;
-            return new Survey(_vtable, instances.Length, playerFlagged, candidates, chosen, problem);
+            return new Survey(_vtable, instances.Length - vanished, playerFlagged, candidates,
+                chosen, problem);
         }
 
         /// <summary>
         /// Which replica to act on. Two exist with identical contents, and only the authoritative
-        /// one reflects a grant in game; the item-count tie-break is there for the case where the
-        /// roles are readable but neither side claims authority.
+        /// one reflects a grant in game.
+        ///
+        /// The item-count tie-break covers the case where the roles read but neither side claims
+        /// authority. On a build that does not map a count there is nothing to rank by, so the
+        /// first is taken — which is the same answer, since the candidates are identical in every
+        /// respect this can see.
         /// </summary>
         private static long Choose(IReadOnlyList<Candidate> candidates)
         {
@@ -124,7 +144,7 @@ namespace Ap.Control.Memory.Mac
             uint mostItems = 0;
             foreach (Candidate candidate in candidates)
                 if (best == 0 || candidate.Items > mostItems)
-                    (best, mostItems) = (candidate.Address, candidate.Items);
+                    (best, mostItems) = (candidate.Address, candidate.Items ?? 0);
             return best;
         }
 

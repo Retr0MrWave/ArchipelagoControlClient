@@ -9,7 +9,7 @@ using Ap.Control.SaveFile;
 using Ap.Control.Utils.Save;
 
 if (args.Length > 0 && args[0] == "dump-save") return DumpSave(args);
-if (args.Length > 0 && args[0] == "probe-game") return ProbeGame();
+if (args.Length > 0 && args[0] == "probe-game") return ProbeGame(args);
 
 return await RunClientAsync(args);
 
@@ -32,13 +32,15 @@ static async Task<int> RunClientAsync(string[] args)
             "                  [--source memory|file] [--save <path>] [--items <apitems.json>]\n" +
             "                  [--ui-port <n>] [--no-ui]\n" +
             "       Ap.Control dump-save [<path>]\n" +
-            "       Ap.Control probe-game\n\n" +
+            "       Ap.Control probe-game [--layout [<rtti-name>]]\n\n" +
             "With --server and --username the client connects on startup as before. Without them it\n" +
             "waits for the in-game Archipelago page to supply the details.\n\n" +
             "dump-save parses a save and prints the location checks it would report, without\n" +
             "connecting to anything. With no path it looks where the client would look.\n\n" +
             "probe-game asks the running game what the client can see of it: the build, whether the\n" +
-            "pump is ticking, and whether the player's inventory can be found. macOS only.");
+            "pump is ticking, and whether the player's inventory can be found. --layout adds what\n" +
+            "the instances in memory say about where the class keeps its fields, for when the scan\n" +
+            "finds objects but none of them the player's. macOS only.");
         return 0;
     }
 
@@ -273,7 +275,7 @@ static int DumpSave(string[] args)
 /// It is also how the inventory scan is confirmed to survive a save load: run it, load a save, run
 /// it again.
 /// </summary>
-static int ProbeGame()
+static int ProbeGame(string[] args)
 {
     if (!OperatingSystem.IsMacOS())
     {
@@ -328,10 +330,18 @@ static int ProbeGame()
     foreach (MacPlayerInventory.Candidate candidate in survey.Candidates)
         Console.WriteLine($"  0x{candidate.Address:x}  role {candidate.Role} "
             + $"({(candidate.Role == 3 ? "authoritative" : "replica")})  "
-            + $"{candidate.Items} item(s)"
+            + (candidate.Items is { } items ? $"{items} item(s)" : "item count not mapped")
             + (candidate.Address == survey.Chosen ? "   <- chosen" : ""));
 
     if (survey.Problem is { } problem) Console.WriteLine($"  {problem}");
+
+    if (args.Contains("--layout"))
+    {
+        string rttiName = args.SkipWhile(a => a != "--layout").Skip(1)
+            .FirstOrDefault(a => !a.StartsWith("--", StringComparison.Ordinal))
+            ?? MacPlayerInventory.RttiName;
+        ReportLayout(shim, rttiName, layout);
+    }
 
     if (survey.Chosen == 0) return 1;
 
@@ -341,6 +351,76 @@ static int ProbeGame()
         ? "  re-checked: the chosen object still looks like the player's inventory."
         : $"  re-checked: it no longer does; a fresh sweep chose 0x{again:x}.");
     return 0;
+}
+
+/// <summary>
+/// Print what the instances in memory say about where a class keeps its fields.
+///
+/// Reached with <c>probe-game --layout [rtti-name]</c>, and worth reaching for when the scan finds
+/// plenty of objects but none that look like the player's — which means the offsets it is reading
+/// are not where this build put them.
+/// </summary>
+static void ReportLayout(ShimClient shim, string rttiName, InventoryLayout layout)
+{
+    const int Window = 0x200;
+
+    Console.WriteLine();
+    Console.WriteLine($"Layout probe: {rttiName}, first 0x{Window:x} bytes of each instance");
+
+    MacLayoutProbe.Report report = MacLayoutProbe.Run(shim, rttiName, Window, layout);
+    if (report.Problem is { } problem)
+    {
+        Console.WriteLine($"  {problem}");
+        return;
+    }
+
+    Console.WriteLine($"  compared {report.Sampled} of {report.Instances} instance(s)");
+
+    Console.WriteLine();
+    Console.WriteLine("  Bytes that single out a few objects from the rest — the player flag should");
+    Console.WriteLine("  be one of these, held by one object per network replica:");
+    if (report.Flags.Count == 0)
+    {
+        Console.WriteLine("    none. Either no instance belongs to the player, or the flag is wider");
+        Console.WriteLine("    than a byte, or it sits beyond the window.");
+    }
+    foreach (MacLayoutProbe.FlagCandidate flag in report.Flags.Take(12))
+        Console.WriteLine($"    +0x{flag.Offset:x3}  0x{flag.Minority:x2} on {flag.Objects.Count} "
+            + $"object(s), 0x{flag.Majority:x2} on the rest   "
+            + string.Join(", ", flag.Objects.Take(4).Select(a => $"0x{a:x}"))
+            + (flag.Objects.Count > 4 ? ", …" : "")
+            + (flag.Offset == layout.IsPlayer ? "   <- currently read as IsPlayer" : ""));
+    if (report.Flags.Count > 12)
+        Console.WriteLine($"    … and {report.Flags.Count - 12} more");
+
+    Console.WriteLine();
+    Console.WriteLine("  Words whose top two bits read as a network role on nearly every object,");
+    Console.WriteLine("  with both replica roles present:");
+    if (report.Roles.Count == 0)
+        Console.WriteLine("    none within the window.");
+    foreach (MacLayoutProbe.RoleCandidate role in report.Roles.Take(12))
+        Console.WriteLine($"    +0x{role.Offset:x3}  roles {{{string.Join(",", role.Roles)}}} on "
+            + $"{role.Matched}/{role.Total}"
+            + (role.Offset == layout.NetRole ? "   <- currently read as NetRole" : ""));
+
+    Console.WriteLine();
+    Console.WriteLine("  Words the player's own objects agree on, small enough to be a count of");
+    Console.WriteLine($"  items — one of these is ItemCount, currently unmapped:");
+    if (report.Counts.Count == 0)
+        Console.WriteLine("    none. Needs the player flag mapped first, and two replicas to compare.");
+    foreach (MacLayoutProbe.CountCandidate count in report.Counts.Take(16))
+        Console.WriteLine($"    +0x{count.Offset:x3}  {count.Value}");
+    if (report.Counts.Count > 16)
+        Console.WriteLine($"    … and {report.Counts.Count - 16} more");
+    if (report.Counts.Count > 0)
+    {
+        Console.WriteLine("    To tell them apart, note which value matches your inventory, pick an");
+        Console.WriteLine("    item up, and run this again: the count is the one that went up by one.");
+    }
+
+    Console.WriteLine();
+    Console.WriteLine("  An offset that appears in both of the first two lists, or a flag offset whose");
+    Console.WriteLine("  objects are a subset of one role offset's, is the pair for InventoryLayout.");
 }
 
 /// <summary>

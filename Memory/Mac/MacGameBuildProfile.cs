@@ -3,26 +3,53 @@ namespace Ap.Control.Memory.Mac
     /// <summary>
     /// Where the fields the inventory scan reads sit inside GameInventoryComponentState.
     ///
-    /// These come from the Windows build, and clang has no reason to lay the class out differently:
-    /// same declaration order, same member types, and nothing here is a <c>long</c>, which is the
-    /// one scalar whose width differs between the two compilers. "No reason to" is not "does not",
-    /// though, so the scan treats them as a claim to be checked rather than a fact — every
-    /// candidate has to carry a plausible network role at <see cref="NetRole"/> before it is
-    /// believed. A build that moved these fields produces no candidates and says so, instead of
-    /// reading a byte from the middle of some other member and acting on it.
+    /// Measured on the Mac build rather than carried over from Windows, because they differ. The
+    /// plan assumed clang would lay this class out as MSVC did — same declaration order, same
+    /// member types, no <c>long</c> to change width — and it does not: the player flag moved from
+    /// +0x90 to +0x45 and the network role from +0x18 to +0x10, which is not a uniform shift.
+    ///
+    /// Found with <c>probe-game --layout</c>, which compares every instance in memory: the role is
+    /// the only word in the first 0x200 bytes whose top two bits read as 2 or 3 across all 47 of
+    /// them, and the flag is the only byte set on exactly two — the two network replicas.
+    ///
+    /// The scan still treats these as a claim rather than a fact, since the next game update can
+    /// move them again. A build that does produces no candidates and says which offset failed.
     /// </summary>
     public sealed record InventoryLayout
     {
-        /// <summary>Byte flag, 1 on the player's own inventory.</summary>
-        public int IsPlayer { get; init; } = 0x90;
+        /// <summary>
+        /// Byte flag, 1 on the player's own inventory.
+        /// </summary>
+        /// <remarks>
+        /// Four bytes in this class are set on exactly the player's two replicas and on nothing
+        /// else — +0x45, +0x55, +0x60 and +0x88 — so any of them locates the object. Which one
+        /// actually means "belongs to the player", as against "is locally controlled" or "is
+        /// replicated", is a question for a disassembler rather than for memory, and worth settling
+        /// alongside the Phase 3 work rather than guessing at now. They agree on this build.
+        /// </remarks>
+        public int IsPlayer { get; init; } = 0x45;
 
         /// <summary>u64 whose top two bits are the network role: 3 authoritative, 2 replica.</summary>
-        public int NetRole { get; init; } = 0x18;
+        public int NetRole { get; init; } = 0x10;
 
-        /// <summary>u32 count of regular items — the size of the vector at +0x40.</summary>
-        public int ItemCount { get; init; } = 0x48;
+        /// <summary>
+        /// u32 count of regular items, or 0 where it is not known.
+        /// </summary>
+        /// <remarks>
+        /// Not mapped on this build. Windows reads it at +0x48; there the two replicas disagree and
+        /// read as about 3.9 billion, which is the low half of a pointer rather than a count of
+        /// anything. Unlike the player flag and the network role, a count has no shape that picks
+        /// it out of a window of memory, so it is left unmapped rather than guessed.
+        ///
+        /// Nothing depends on it. It breaks a tie between candidates when none claims the
+        /// authoritative role, which does not arise while <see cref="NetRole"/> reads correctly, and
+        /// it would otherwise serve as one of the confirmation checks in MACOS_PORT.md §4.4 —
+        /// comparing it against the save's inventory size. <c>probe-game --layout</c> lists the
+        /// offsets where the player's replicas agree on a small value, which is where to look.
+        /// </remarks>
+        public int ItemCount { get; init; }
 
-        /// <summary>How far into an object the scan has to read to see all three.</summary>
+        /// <summary>How far into an object the scan has to read to see the mapped fields.</summary>
         public int WindowSize => Math.Max(IsPlayer + 1, Math.Max(NetRole + 8, ItemCount + 4));
 
         public static InventoryLayout Default { get; } = new();
