@@ -32,7 +32,7 @@ static async Task<int> RunClientAsync(string[] args)
             "                  [--source memory|file] [--save <path>] [--items <apitems.json>]\n" +
             "                  [--ui-port <n>] [--no-ui]\n" +
             "       Ap.Control dump-save [<path>]\n" +
-            "       Ap.Control probe-game [--layout [<rtti-name>]]\n\n" +
+            "       Ap.Control probe-game [--layout [<rtti-name>]] [--snapshot <path>]\n\n" +
             "With --server and --username the client connects on startup as before. Without them it\n" +
             "waits for the in-game Archipelago page to supply the details.\n\n" +
             "dump-save parses a save and prints the location checks it would report, without\n" +
@@ -40,7 +40,9 @@ static async Task<int> RunClientAsync(string[] args)
             "probe-game asks the running game what the client can see of it: the build, whether the\n" +
             "pump is ticking, and whether the player's inventory can be found. --layout adds what\n" +
             "the instances in memory say about where the class keeps its fields, for when the scan\n" +
-            "finds objects but none of them the player's. macOS only.");
+            "finds objects but none of them the player's. --snapshot records the player's object and,\n" +
+            "on a later run, reports what changed — which is how to find a field that has no shape of\n" +
+            "its own, like an item count. macOS only.");
         return 0;
     }
 
@@ -337,10 +339,25 @@ static int ProbeGame(string[] args)
 
     if (args.Contains("--layout"))
     {
-        string rttiName = args.SkipWhile(a => a != "--layout").Skip(1)
-            .FirstOrDefault(a => !a.StartsWith("--", StringComparison.Ordinal))
-            ?? MacPlayerInventory.RttiName;
-        ReportLayout(shim, rttiName, layout);
+        // Only the token immediately after --layout, and only if it is not itself a flag. Taking
+        // the first non-flag anywhere after it swallows the argument of whatever flag comes next.
+        string? named = args.SkipWhile(a => a != "--layout").Skip(1).FirstOrDefault();
+        string rttiName = named is not null && !named.StartsWith("--", StringComparison.Ordinal)
+            ? named
+            : MacPlayerInventory.RttiName;
+        string? snapshot = args.SkipWhile(a => a != "--snapshot").Skip(1).FirstOrDefault();
+
+        // Widen when a diff comes back empty: it means the field is not in the window, and the
+        // object is bigger than the 0x200 bytes that were enough to find the flag and the role.
+        string? width = args.SkipWhile(a => a != "--window").Skip(1).FirstOrDefault();
+        int window = 0x200;
+        if (width is not null && !TryParseSize(width, out window))
+        {
+            Console.Error.WriteLine($"[probe] --window wants a size like 0x400, got '{width}'");
+            return 1;
+        }
+
+        ReportLayout(shim, rttiName, layout, snapshot, window);
     }
 
     if (survey.Chosen == 0) return 1;
@@ -360,14 +377,30 @@ static int ProbeGame(string[] args)
 /// plenty of objects but none that look like the player's — which means the offsets it is reading
 /// are not where this build put them.
 /// </summary>
-static void ReportLayout(ShimClient shim, string rttiName, InventoryLayout layout)
+/// <summary>A size, decimal or 0x-prefixed, within what is sane to read from one object.</summary>
+static bool TryParseSize(string text, out int size)
 {
-    const int Window = 0x200;
+    size = 0;
+    try
+    {
+        size = text.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+            ? Convert.ToInt32(text[2..], 16)
+            : int.Parse(text);
+    }
+    catch (Exception)
+    {
+        return false;
+    }
+    return size is >= 0x20 and <= 0x10000;
+}
 
+static void ReportLayout(ShimClient shim, string rttiName, InventoryLayout layout, string? snapshot,
+    int window)
+{
     Console.WriteLine();
-    Console.WriteLine($"Layout probe: {rttiName}, first 0x{Window:x} bytes of each instance");
+    Console.WriteLine($"Layout probe: {rttiName}, first 0x{window:x} bytes of each instance");
 
-    MacLayoutProbe.Report report = MacLayoutProbe.Run(shim, rttiName, Window, layout);
+    MacLayoutProbe.Report report = MacLayoutProbe.Run(shim, rttiName, window, layout);
     if (report.Problem is { } problem)
     {
         Console.WriteLine($"  {problem}");
@@ -421,6 +454,75 @@ static void ReportLayout(ShimClient shim, string rttiName, InventoryLayout layou
     Console.WriteLine();
     Console.WriteLine("  An offset that appears in both of the first two lists, or a flag offset whose");
     Console.WriteLine("  objects are a subset of one role offset's, is the pair for InventoryLayout.");
+
+    if (snapshot is not null) SnapshotOrDiff(report, snapshot);
+}
+
+/// <summary>
+/// Record the player's object, or say what changed since it was last recorded.
+///
+/// Comparing instances against each other finds fields that tell objects apart. It cannot find a
+/// count, because a count has no shape — any small number looks like one, and on this build every
+/// candidate it offered was a constant that survived picking an item up. Comparing the same object
+/// against itself across an action finds fields that track that action, which is the question
+/// actually being asked.
+/// </summary>
+static void SnapshotOrDiff(MacLayoutProbe.Report report, string path)
+{
+    var current = report.Players.ToDictionary(player => player.Role);
+
+    Console.WriteLine();
+    if (!File.Exists(path))
+    {
+        var lines = current.Values.Select(player =>
+            $"{player.Role} {player.Address:x} {Convert.ToHexString(player.Window)}");
+        File.WriteAllLines(path, lines);
+
+        Console.WriteLine($"  Snapshot of {current.Count} player object(s) written to {path}.");
+        Console.WriteLine("  Now do the thing you want to find the field for — pick an item up — and");
+        Console.WriteLine("  run this again with the same --snapshot path to see what moved.");
+        return;
+    }
+
+    var before = new Dictionary<int, MacLayoutProbe.PlayerSnapshot>();
+    foreach (string line in File.ReadAllLines(path))
+    {
+        string[] parts = line.Split(' ');
+        if (parts.Length != 3) continue;
+        before[int.Parse(parts[0])] = new MacLayoutProbe.PlayerSnapshot(
+            int.Parse(parts[0]), Convert.ToInt64(parts[1], 16), Convert.FromHexString(parts[2]));
+    }
+
+    Console.WriteLine($"  Changes since {path} was written "
+        + $"({File.GetLastWriteTime(path):HH:mm:ss}):");
+
+    foreach ((int role, MacLayoutProbe.PlayerSnapshot was) in before.OrderByDescending(e => e.Key))
+    {
+        if (!current.TryGetValue(role, out MacLayoutProbe.PlayerSnapshot now))
+        {
+            Console.WriteLine($"    role {role}: no longer present");
+            continue;
+        }
+
+        List<MacLayoutProbe.Change> changes = MacLayoutProbe.Diff(was, now);
+        Console.WriteLine($"    role {role} @ 0x{now.Address:x}"
+            + (now.Address != was.Address ? $" (was 0x{was.Address:x} — reallocated)" : "")
+            + $": {changes.Count} word(s) changed");
+
+        // Anything the diff recognised leads, since that is the whole point of running it.
+        foreach (MacLayoutProbe.Change change in changes.Where(c => c.Note.Length > 0))
+            Console.WriteLine($"      +0x{change.Offset:x3}  {change.Before} -> {change.After}"
+                + $"   <- {change.Note}");
+
+        foreach (MacLayoutProbe.Change change in changes.Where(c => c.Note.Length == 0).Take(24))
+            Console.WriteLine($"      +0x{change.Offset:x3}  0x{change.Before:x} -> 0x{change.After:x}");
+
+        int quiet = changes.Count(c => c.Note.Length == 0);
+        if (quiet > 24) Console.WriteLine($"      … and {quiet - 24} more");
+    }
+
+    Console.WriteLine();
+    Console.WriteLine("  Delete the snapshot file to start a fresh comparison.");
 }
 
 /// <summary>

@@ -30,6 +30,9 @@ namespace Ap.Control.Memory.Mac
         /// <summary>A word the player's replicas agree on, small enough to be a count of things.</summary>
         internal readonly record struct CountCandidate(int Offset, uint Value);
 
+        /// <summary>One player-owned object's bytes, kept so a later run can diff against them.</summary>
+        internal readonly record struct PlayerSnapshot(int Role, long Address, byte[] Window);
+
         internal readonly record struct Report(
             ulong Vtable,
             int Instances,
@@ -37,6 +40,7 @@ namespace Ap.Control.Memory.Mac
             IReadOnlyList<FlagCandidate> Flags,
             IReadOnlyList<RoleCandidate> Roles,
             IReadOnlyList<CountCandidate> Counts,
+            IReadOnlyList<PlayerSnapshot> Players,
             string? Problem);
 
         /// <summary>How many objects may hold the minority value and still look like a flag.</summary>
@@ -47,12 +51,12 @@ namespace Ap.Control.Memory.Mac
         {
             ShimVtableLookup lookup = shim.Vtables(rttiName);
             if (lookup.Primary is not { } primary)
-                return new Report(0, 0, 0, [], [], [],
+                return new Report(0, 0, 0, [], [], [], [],
                     lookup.Error ?? $"{rttiName} has no primary vtable in this build");
 
             long[] instances = shim.Scan(BitConverter.GetBytes(primary.Address), align: 8);
             if (instances.Length == 0)
-                return new Report(primary.Address, 0, 0, [], [], [],
+                return new Report(primary.Address, 0, 0, [], [], [], [],
                     $"no instances of {rttiName} are in memory");
 
             // Two kinds of object are left out rather than compared. One whose window could not be
@@ -72,12 +76,79 @@ namespace Ap.Control.Memory.Mac
             }
 
             if (windows.Count < 2)
-                return new Report(primary.Address, instances.Length, windows.Count, [], [], [],
+                return new Report(primary.Address, instances.Length, windows.Count, [], [], [], [],
                     "too few instances could be read to compare them");
 
             return new Report(primary.Address, instances.Length, windows.Count,
                 FindFlags(addresses, windows, window), FindRoles(windows, window),
-                FindCounts(windows, window, layout), null);
+                FindCounts(windows, window, layout), Players(addresses, windows, layout), null);
+        }
+
+        /// <summary>The player's own objects, keyed by role so a later run can match them up.</summary>
+        private static List<PlayerSnapshot> Players(
+            List<long> addresses, List<byte[]> windows, InventoryLayout? layout)
+        {
+            var found = new List<PlayerSnapshot>();
+            if (layout is not { } fields) return found;
+
+            for (int i = 0; i < windows.Count; i++)
+            {
+                if (windows[i][fields.IsPlayer] != 1) continue;
+                int role = (int)((BitConverter.ToUInt64(windows[i], fields.NetRole) >> 62) & 3);
+                found.Add(new PlayerSnapshot(role, addresses[i], windows[i]));
+            }
+            return found;
+        }
+
+        /// <summary>What one field looked like before and after.</summary>
+        internal readonly record struct Change(int Offset, ulong Before, ulong After, string Note);
+
+        /// <summary>
+        /// What changed in the player's object between two runs.
+        ///
+        /// The comparison across instances finds fields that distinguish objects; this finds fields
+        /// that track events, which is the only way to identify a count. A count has no shape — any
+        /// small number will do — so the way to recognise one is to do something that changes it and
+        /// see what moved. Picking an item up should raise it by exactly one, or, if the items live
+        /// in a container rather than beside a counter, advance an end pointer by one element while
+        /// the pointer before it stays put.
+        ///
+        /// Matched on role rather than address, since the object can be reallocated between runs.
+        /// </summary>
+        internal static List<Change> Diff(PlayerSnapshot before, PlayerSnapshot after)
+        {
+            var changes = new List<Change>();
+            int window = Math.Min(before.Window.Length, after.Window.Length);
+
+            for (int offset = 0; offset + 4 <= window; offset += 4)
+            {
+                uint was = BitConverter.ToUInt32(before.Window, offset);
+                uint now = BitConverter.ToUInt32(after.Window, offset);
+                if (was == now) continue;
+
+                // A word that rose by exactly one, having been a plausible tally to begin with.
+                string note = "";
+                if (now == was + 1 && was < 1 << 20) note = "rose by one — this is the shape a count has";
+
+                // The other shape: a container's end pointer stepping forward by one element while
+                // its start stays where it was.
+                if (note.Length == 0 && offset % 8 == 0 && offset + 8 <= window)
+                {
+                    ulong wasWide = BitConverter.ToUInt64(before.Window, offset);
+                    ulong nowWide = BitConverter.ToUInt64(after.Window, offset);
+                    bool startHeld = offset >= 8
+                        && BitConverter.ToUInt64(before.Window, offset - 8)
+                           == BitConverter.ToUInt64(after.Window, offset - 8);
+
+                    if (startHeld && nowWide > wasWide && nowWide - wasWide <= 4096
+                        && PointerRange.MacOS.Contains(wasWide))
+                        note = $"advanced {nowWide - wasWide} bytes with +0x{offset - 8:x} unmoved — "
+                             + "this is the shape a container's end has";
+                }
+
+                changes.Add(new Change(offset, was, now, note));
+            }
+            return changes;
         }
 
         /// <summary>
