@@ -70,11 +70,17 @@ check: $(DYLIB) $(FAKEGAME) $(CHECKCLI)
 
 # --- install ---------------------------------------------------------------------------------
 
+# Copy then rename, rather than writing over the file in place. A running game has this dylib
+# mapped, and overwriting the bytes underneath it means the next page it faults in is from a
+# different build - a crash, in the player's session, at a moment unrelated to the install.
+# Renaming leaves that process on the old inode until it exits.
 install: $(DYLIB)
 	mkdir -p "$(INSTALL_DIR)"
-	cp $(DYLIB) "$(INSTALL_DIR)/"
-	cp apcontrol-launch.sh "$(INSTALL_DIR)/"
-	chmod 755 "$(INSTALL_DIR)/apcontrol-launch.sh"
+	cp $(DYLIB) "$(INSTALL_DIR)/.libapcontrol.dylib.new"
+	mv -f "$(INSTALL_DIR)/.libapcontrol.dylib.new" "$(INSTALL_DIR)/libapcontrol.dylib"
+	cp apcontrol-launch.sh "$(INSTALL_DIR)/.apcontrol-launch.sh.new"
+	chmod 755 "$(INSTALL_DIR)/.apcontrol-launch.sh.new"
+	mv -f "$(INSTALL_DIR)/.apcontrol-launch.sh.new" "$(INSTALL_DIR)/apcontrol-launch.sh"
 # A dylib that still carries a quarantine flag is refused inside a hardened process, and the flag
 # is attached by whatever downloaded it, not by us.
 	xattr -d com.apple.quarantine "$(INSTALL_DIR)/libapcontrol.dylib" 2>/dev/null || true

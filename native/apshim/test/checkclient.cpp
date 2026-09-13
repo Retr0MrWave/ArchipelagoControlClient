@@ -120,6 +120,28 @@ bool read_u64(uint64_t id, uint64_t address, uint64_t& out) {
     return true;
 }
 
+/// Connect, with a receive timeout.
+///
+/// The timeout is the point: the failure this guards against is the shim going quiet, and a test
+/// that hangs forever on it reports nothing useful. Well above any legitimate wait - a call op can
+/// sit for its own five seconds - and well below anything a person or a CI job would wait out.
+int connect_to(const char* path) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    timeval patience { 15, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &patience, sizeof patience);
+
+    sockaddr_un address {};
+    address.sun_family = AF_UNIX;
+    std::strncpy(address.sun_path, path, sizeof address.sun_path - 1);
+    if (connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof address) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -128,11 +150,8 @@ int main(int argc, char** argv) {
         return 64;
     }
 
-    g_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    sockaddr_un address {};
-    address.sun_family = AF_UNIX;
-    std::strncpy(address.sun_path, argv[1], sizeof address.sun_path - 1);
-    if (connect(g_fd, reinterpret_cast<sockaddr*>(&address), sizeof address) != 0) {
+    g_fd = connect_to(argv[1]);
+    if (g_fd < 0) {
         fprintf(stderr, "checkclient: cannot connect to %s: %s\n", argv[1], strerror(errno));
         return 1;
     }
@@ -270,6 +289,37 @@ int main(int argc, char** argv) {
             fail("vtable rejected 'tableProbe' without finding it: " + tail);
         else
             pass("vtable finds a name no type_info points at, and rejects it");
+    }
+
+    // --- a second client, while the first is still attached -------------------------------------
+    //
+    // The shim used to accept one connection and serve it to completion before accepting another,
+    // so a second client connected, sent, and waited forever in the listen backlog with nobody
+    // reading. That is what running probe-game alongside the client looked like: seventy seconds
+    // of silence and then a timeout indistinguishable from the game not being there.
+    //
+    // This connects a second time WITHOUT closing the first, which is the only arrangement that
+    // reproduces it, and requires both to keep answering.
+    int second = connect_to(argv[1]);
+    if (second < 0) {
+        fail("could not open a second connection while the first was attached");
+    } else {
+        int first = g_fd;
+
+        g_fd = second;
+        bool second_answers = ok(request("13 ping"));
+
+        g_fd = first;
+        bool first_still_answers = ok(request("14 ping"));
+
+        if (!second_answers)
+            fail("a second client got no answer while the first was attached");
+        else if (!first_still_answers)
+            fail("the first client stopped answering once a second attached");
+        else
+            pass("two clients are served at once");
+
+        close(second);
     }
 
     close(g_fd);

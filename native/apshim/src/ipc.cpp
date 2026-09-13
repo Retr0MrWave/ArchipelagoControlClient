@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -56,14 +57,43 @@ constexpr size_t kMaxScanHits = 65536;
 /// loses the least interesting ones.
 constexpr size_t kMaxQueuedEvents = 256;
 
-std::mutex g_send_lock;
-int g_client = -1;  // guarded by g_send_lock
+/// More than the client plus a diagnostic or two. This is a bound on threads running inside the
+/// game, so it is a small number on purpose.
+constexpr size_t kMaxClients = 8;
+
+/// One connected client.
+///
+/// The shim used to serve a single connection at a time: accept, serve until it closed, accept
+/// again. That made a second connection - the player running `probe-game` while the client is
+/// attached - sit unaccepted in the listen backlog. It connected, sent, and waited, because
+/// nothing was reading. Diagnosing the game while playing it is exactly when a diagnostic is
+/// wanted, so each connection now gets its own thread.
+///
+/// Held by shared_ptr so the event thread can hold a reference to a client that its own serving
+/// thread is tearing down.
+struct Client {
+    explicit Client(int descriptor) : fd(descriptor) {}
+
+    /// Guards both writing to the descriptor and closing it. The event thread works from a
+    /// snapshot of the client list, so without this it could still be writing to a connection the
+    /// serving thread has just closed - and by then the number may belong to something else.
+    std::mutex send;
+    int fd;  ///< -1 once closed
+};
+
+std::mutex g_clients_lock;
+std::vector<std::shared_ptr<Client>> g_clients;
 
 std::mutex g_event_lock;
 std::condition_variable g_event_cv;
 std::deque<std::string> g_events;
 
 std::string g_socket_path;
+
+std::vector<std::shared_ptr<Client>> connected_clients() {
+    std::lock_guard<std::mutex> guard(g_clients_lock);
+    return g_clients;
+}
 
 // --- framing ----------------------------------------------------------------------------------
 
@@ -98,22 +128,33 @@ bool recv_bytes(int fd, void* out, size_t len) {
     return true;
 }
 
-/// Send one frame to the connected client, if there is one. Takes the send lock for the whole
-/// frame so a response and an event can never interleave halfway through.
-bool send_frame(uint8_t kind, const void* payload, size_t len) {
-    std::lock_guard<std::mutex> guard(g_send_lock);
-    if (g_client < 0) return false;
+/// Send one frame to one client. Takes that connection's send lock for the whole frame so a
+/// response and an event can never interleave halfway through.
+bool send_frame(Client& client, uint8_t kind, const void* payload, size_t len) {
+    std::lock_guard<std::mutex> guard(client.send);
+    if (client.fd < 0) return false;
 
     uint8_t header[5];
     uint32_t total = static_cast<uint32_t>(len + 1);
     std::memcpy(header, &total, 4);
     header[4] = kind;
 
-    if (!send_bytes(g_client, header, sizeof header)) return false;
-    return len == 0 || send_bytes(g_client, payload, len);
+    if (!send_bytes(client.fd, header, sizeof header)) return false;
+    return len == 0 || send_bytes(client.fd, payload, len);
 }
 
-bool send_json(const std::string& json) { return send_frame(kJson, json.data(), json.size()); }
+bool send_json(Client& client, const std::string& json) {
+    return send_frame(client, kJson, json.data(), json.size());
+}
+
+/// Close a connection under the same lock that guards writing to it, so no other thread can be
+/// mid-send when the descriptor goes away.
+void close_client(Client& client) {
+    std::lock_guard<std::mutex> guard(client.send);
+    if (client.fd < 0) return;
+    close(client.fd);
+    client.fd = -1;
+}
 
 bool recv_frame(int fd, uint8_t& kind, std::vector<uint8_t>& payload) {
     uint8_t header[5];
@@ -355,10 +396,10 @@ std::string op_call(uint64_t id, const std::vector<std::string>& args) {
 }
 
 /// Handle one request. Returns false only when the connection should be dropped.
-bool handle(int fd, const std::string& line) {
+bool handle(Client& client, const std::string& line) {
     std::vector<std::string> args = tokenise(line);
     if (args.size() < 2) {
-        send_json(fail(0, "expected '<id> <op> [args...]'"));
+        send_json(client, fail(0, "expected '<id> <op> [args...]'"));
         return true;
     }
 
@@ -366,11 +407,11 @@ bool handle(int fd, const std::string& line) {
     const std::string& op = args[1];
 
     if (op == "ping") {
-        send_json(json::Object().num("id", id).flag("ok", true).str());
+        send_json(client, json::Object().num("id", id).flag("ok", true).str());
     } else if (op == "hello") {
-        send_json(op_hello(id));
+        send_json(client, op_hello(id));
     } else if (op == "pump") {
-        send_json(json::Object()
+        send_json(client, json::Object()
                       .num("id", id)
                       .flag("ok", true)
                       .flag("ticking", mainthread::ticking())
@@ -378,81 +419,81 @@ bool handle(int fd, const std::string& line) {
                       .str());
     } else if (op == "sym") {
         if (args.size() < 3) {
-            send_json(fail(id, "usage: sym <mangled-name>"));
+            send_json(client, fail(id, "usage: sym <mangled-name>"));
         } else {
-            send_json(
+            send_json(client, 
                 json::Object().num("id", id).flag("ok", true).num("addr", symbols::resolve(args[2])).str());
         }
     } else if (op == "vtable") {
-        send_json(op_vtable(id, args));
+        send_json(client, op_vtable(id, args));
     } else if (op == "regions") {
-        send_json(op_regions(id, args.size() < 3 || args[2] != "all"));
+        send_json(client, op_regions(id, args.size() < 3 || args[2] != "all"));
     } else if (op == "read") {
         if (args.size() < 4) {
-            send_json(fail(id, "usage: read <addr> <len>"));
+            send_json(client, fail(id, "usage: read <addr> <len>"));
         } else {
             uint64_t addr = number(args[2]);
             size_t len = static_cast<size_t>(number(args[3]));
             if (len == 0 || len > kMaxRead) {
-                send_json(fail(id, "length must be between 1 and 16 MiB"));
+                send_json(client, fail(id, "length must be between 1 and 16 MiB"));
             } else {
                 std::vector<uint8_t> buffer(len);
                 size_t got = memory::read(addr, buffer.data(), len);
                 // A short read is a legitimate answer, not a failure: the caller asked for a
                 // window and the region ended. Zero means nothing was readable at all.
-                send_json(json::Object().num("id", id).flag("ok", got > 0).num("len", got).str());
-                if (got > 0) send_frame(kBinary, buffer.data(), got);
+                send_json(client, json::Object().num("id", id).flag("ok", got > 0).num("len", got).str());
+                if (got > 0) send_frame(client, kBinary, buffer.data(), got);
             }
         }
     } else if (op == "write") {
         if (args.size() < 4) {
-            send_json(fail(id, "usage: write <addr> <len>, followed by a binary frame"));
+            send_json(client, fail(id, "usage: write <addr> <len>, followed by a binary frame"));
         } else {
             uint64_t addr = number(args[2]);
             size_t len = static_cast<size_t>(number(args[3]));
 
             uint8_t kind = 0;
             std::vector<uint8_t> body;
-            if (!recv_frame(fd, kind, body)) return false;  // client vanished mid-request
+            if (!recv_frame(client.fd, kind, body)) return false;  // client vanished mid-request
 
             if (kind != kBinary || body.size() != len) {
-                send_json(fail(id, "the body frame did not match the declared length"));
+                send_json(client, fail(id, "the body frame did not match the declared length"));
             } else {
                 size_t wrote = memory::write(addr, body.data(), body.size());
                 json::Object response;
                 response.num("id", id).flag("ok", wrote == body.size()).num("written", wrote);
                 if (wrote != body.size())
                     response.text("error", "the target is not in a writable mapping");
-                send_json(response.str());
+                send_json(client, response.str());
             }
         }
     } else if (op == "scan") {
-        send_json(op_scan(id, args));
+        send_json(client, op_scan(id, args));
     } else if (op == "keys") {
         std::vector<uint8_t> body;
-        send_json(op_keys(id, args, body));
-        if (!body.empty()) send_frame(kBinary, body.data(), body.size());
+        send_json(client, op_keys(id, args, body));
+        if (!body.empty()) send_frame(client, kBinary, body.data(), body.size());
     } else if (op == "call") {
-        send_json(op_call(id, args));
+        send_json(client, op_call(id, args));
     } else {
-        send_json(fail(id, "unknown op '" + op + "'"));
+        send_json(client, fail(id, "unknown op '" + op + "'"));
     }
     return true;
 }
 
 // --- threads --------------------------------------------------------------------------------
 
-void serve(int fd) {
+void serve(Client& client) {
     while (true) {
         uint8_t kind = 0;
         std::vector<uint8_t> payload;
-        if (!recv_frame(fd, kind, payload)) return;
+        if (!recv_frame(client.fd, kind, payload)) return;
 
         if (kind != kText) {
-            send_json(fail(0, "expected a text request frame"));
+            send_json(client, fail(0, "expected a text request frame"));
             continue;
         }
-        if (!handle(fd, std::string(payload.begin(), payload.end()))) return;
+        if (!handle(client, std::string(payload.begin(), payload.end()))) return;
     }
 }
 
@@ -466,7 +507,11 @@ void event_loop() {
             event = std::move(g_events.front());
             g_events.pop_front();
         }
-        send_frame(kEvent, event.data(), event.size());
+
+        // Everyone attached hears about it. A diagnostic connected alongside the client should see
+        // the same saves the client does.
+        for (const std::shared_ptr<Client>& client : connected_clients())
+            send_frame(*client, kEvent, event.data(), event.size());
     }
 }
 
@@ -483,20 +528,49 @@ void accept_loop(int server) {
         int on = 1;
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
 
-        {
-            std::lock_guard<std::mutex> guard(g_send_lock);
-            g_client = fd;
-        }
-        logf("ipc: client connected");
+        auto client = std::make_shared<Client>(fd);
 
-        serve(fd);
-
+        size_t count = 0;
+        bool accepted = false;
         {
-            std::lock_guard<std::mutex> guard(g_send_lock);
-            g_client = -1;
+            std::lock_guard<std::mutex> guard(g_clients_lock);
+            if (g_clients.size() < kMaxClients) {
+                g_clients.push_back(client);
+                accepted = true;
+            }
+            count = g_clients.size();
         }
-        close(fd);
-        logf("ipc: client disconnected");
+
+        if (!accepted) {
+            // Say so rather than accepting and never reading. Silence on a socket is the one
+            // failure mode that looks identical to the game not running, which is precisely the
+            // confusion this whole change exists to remove.
+            logf("ipc: refused a connection; %zu already attached", count);
+            send_json(*client, fail(0, "the shim already has as many clients as it will take"));
+            close_client(*client);
+            continue;
+        }
+
+        logf("ipc: client connected (%zu attached)", count);
+
+        std::thread([client] {
+            pthread_setname_np("ap.shim.client");
+            serve(*client);
+
+            size_t left = 0;
+            {
+                std::lock_guard<std::mutex> guard(g_clients_lock);
+                for (auto it = g_clients.begin(); it != g_clients.end(); ++it)
+                    if (it->get() == client.get()) {
+                        g_clients.erase(it);
+                        break;
+                    }
+                left = g_clients.size();
+            }
+
+            close_client(*client);
+            logf("ipc: client disconnected (%zu attached)", left);
+        }).detach();
     }
 }
 
