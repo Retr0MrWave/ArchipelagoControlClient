@@ -46,11 +46,28 @@
 
   <ItemGroup>
     <Compile Remove="Ap.Control.Patcher\**" />
-    <Compile Remove="tools\**" />
+    <Compile Remove="native\**" />
     <EmbeddedResource Remove="Ap.Control.Patcher\**" />
-    <EmbeddedResource Remove="tools\**" />
+    <EmbeddedResource Remove="native\**" />
     <None Remove="Ap.Control.Patcher\**" />
-    <None Remove="tools\**" />
+    <None Remove="native\**" />
+  </ItemGroup>
+
+  <!-- The macOS client carries the helper dylib and its launch wrapper, so `install-launcher` can
+       write them out itself. That is not only convenience: a file the client writes is not
+       quarantined, whereas the same two files extracted from a downloaded archive may be - and a
+       quarantined dylib is refused inside a hardened-runtime process.
+
+       Conditional on the dylib existing so a checkout that has not run `make -C native/apshim`
+       still builds. When it is missing, `install-launcher` says so and points at the Makefile
+       rather than writing a truncated file. Items do not affect the restore graph, so unlike the
+       properties above these conditions are safe. -->
+  <ItemGroup Condition="'$(RuntimeIdentifier)' == 'osx-arm64'">
+    <EmbeddedResource Include="native\apshim\out\libapcontrol.dylib"
+                      LogicalName="libapcontrol.dylib"
+                      Condition="Exists('native\apshim\out\libapcontrol.dylib')" />
+    <EmbeddedResource Include="native\apshim\apcontrol-launch.sh"
+                      LogicalName="apcontrol-launch.sh" />
   </ItemGroup>
 
   <ItemGroup>

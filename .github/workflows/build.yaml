@@ -76,6 +76,18 @@ jobs:
       - name: Publish patcher
         run: dotnet publish Ap.Control.Patcher/Ap.Control.Patcher.csproj -c Release --no-restore -o publish/patcher
 
+      # The client embeds the shim so `install-launcher` can write it out, and that embed is
+      # conditional on the dylib existing when the client is built. If the shim step above ever
+      # stops running first, the publish still succeeds and the failure surfaces as a player whose
+      # game loads nothing. Run the installer for real and insist it wrote the dylib.
+      - name: Check the client carries the shim
+        run: |
+          ./publish/client/Ap.Control install-launcher
+          test -f "$HOME/Library/Application Support/Ap.Control/libapcontrol.dylib"
+          test -x "$HOME/Library/Application Support/Ap.Control/apcontrol-launch.sh"
+          cmp "$HOME/Library/Application Support/Ap.Control/libapcontrol.dylib" \
+              native/apshim/out/libapcontrol.dylib
+
       # One archive, because the four pieces only work together - and because tar preserves the
       # executable bit and adds no quarantine flag, which a zip downloaded by a browser would.
       - name: Package

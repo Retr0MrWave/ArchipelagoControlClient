@@ -24,7 +24,7 @@ The second reason is to lock the normal way of unlocking weapons (the Astral Con
 ## macOS
 
 The macOS release is one archive, `Ap.Control-osx-arm64.tar.gz` (Apple silicon; the game has no
-Intel build). Extract it and keep the four files together.
+Intel build). Extract it and keep the files together.
 
 **1. Patch the game.** Same commands as Windows, without the `.exe`:
 ```sh
@@ -34,35 +34,54 @@ The patcher finds `Control/Game.app` in your Steam library on its own. If it doe
 `--game` pointing at the `Control` folder, at `Game.app`, or at `Game.app/Contents/Resources` —
 any of the three works.
 
-**2. Install the launch wrapper.** Copy `libapcontrol.dylib` and `apcontrol-launch.sh` into
-`~/Library/Application Support/Ap.Control/`, make the script executable, and set Control's Steam
-**Launch Options** to:
-
-    "/Users/YOUR-NAME/Library/Application Support/Ap.Control/apcontrol-launch.sh" %command%
-
-From a source checkout, `make -C native/apshim install` does the copying and prints the exact line
-to paste.
+**2. Set up the launcher.**
+```sh
+./Ap.Control install-launcher
+```
+This writes a small helper library into `~/Library/Application Support/Ap.Control/` and prints the
+line to paste into Control's Steam **Launch Options** (right-click Control → Properties → General).
+It copies the line to your clipboard too, because it contains your home directory and a space, and
+a mistyped one fails by the game simply starting unmodified.
 
 The wrapper exists because Steam on macOS starts games through LaunchServices, which drops the
-environment — so the usual `VAR=value %command%` trick does nothing here. It loads a small helper
-library into the game; without it, the game runs exactly as it always did.
+environment — so the usual `VAR=value %command%` trick does nothing here. It loads the helper into
+the game; without it, the game runs exactly as it always did.
 
 **3. Run the client**, then launch the game from Steam as usual.
 
-### What works on macOS today
-Security clearance, sector and door unlocks, elevator gating, the in-game Archipelago page, and
-location tracking. Inventory items and ability upgrades do not yet — the client says so rather
-than failing silently. `MACOS_PORT.md` has the detail on what is left.
+### What works on macOS
 
-### If macOS refuses to load the helper
+Everything the Windows client does: security clearance, sector and door unlocks, elevator gating,
+inventory items, ability upgrades, the progressive weapon and mod slots, the in-game Archipelago
+page, and location tracking.
+
+### Updating the client
+
+Run `install-launcher` again after installing a new release — the helper library ships with the
+client and the two are a matched pair. **Quit Control first.** A running game keeps using the
+library it loaded when it started, so an install performed underneath it has no effect and no
+error; it simply carries on with the old one until you restart it.
+
+### If something is not working
+
+`./Ap.Control probe-game` asks the running game what the client can see of it — whether the helper
+loaded, which build, whether the game is running frames, and whether it can find your inventory —
+printing each step separately, so the one that broke is visible. The helper's own log is at
+`~/Library/Logs/Ap.Control/shim.log`.
+
+If the game starts but nothing is connected, the launch option is the usual culprit: re-run
+`install-launcher` and paste the line again.
+
 A file downloaded by a browser is quarantined, and a quarantined library will not load into the
-game. Clear it with:
+game. `install-launcher` handles this for the files it writes; if you copied them by hand instead:
 ```sh
 xattr -dr com.apple.quarantine ~/Library/Application\ Support/Ap.Control
 ```
 
 As on Windows, Steam's "verify integrity of game files" and game updates revert the patches — run
-`apply all` again afterwards.
+`apply all` again afterwards. A game update can also move the addresses the item and ability grants
+use; the client checks the game's build id and says which features are unavailable rather than
+failing silently.
 
 ## Client
 To run the client, you can open the executable before launching the game. You will have access to a page to log into the Archipelago in the Main Menu as well as in the Pause Menu. If you do not have a save yet or your current save is from the Archipelago, you can login from the Main Menu just fine, or wait until you are in game. If you already have a save loaded that is not from the Archipelago, I would start a new game and then log in from the pause menu.

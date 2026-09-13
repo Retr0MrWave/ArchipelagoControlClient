@@ -797,12 +797,17 @@ Commands that do exist: `dump-save`, `probe-game`, `try-unlock` (§0.6).
     offset it had was a byte of an adjacent vector's capacity, agreeing with the truth by accident.
     The item count remains unmapped; a second candidate for it was tried and rejected too (§4.4).
 
-**Phase 4 — Ship (1 day)**
-- CI: add a `macos-latest` job (arm64 runner) that builds the dylib, publishes client + patcher for
-  `osx-arm64`, and uploads a `.tar.gz` per tool; keep the Windows job unchanged.
-- README: macOS section (launch option line, quarantine note, "verify integrity reverts patches",
-  where logs live). Release notes.
-- `install-launcher` / `--launch` UX polish; startup banner explains what is and is not mapped.
+**Phase 4 — Ship — DONE except release notes**
+- CI: a `macos-latest` job builds the dylib, runs `make check`, publishes client + patcher for
+  `osx-arm64`, and adds one `.tar.gz` to the release. It also runs `install-launcher` for real and
+  insists the dylib came out of the client, so the conditional embed cannot regress silently into a
+  client that installs nothing.
+- README: macOS section rewritten around `install-launcher`, including the one thing a player cannot
+  deduce — a running game keeps the library it loaded, so an install underneath it does nothing.
+- `install-launcher` writes both files atomically, clears quarantine, prints and copies the launch
+  option, and warns when a shim is already loaded. `--launch` starts the game directly for a dev
+  loop. The startup banner already explained what is and is not mapped.
+- Left: release notes, and `--launch` has not been run end to end against a real Steam session.
 
 Total: roughly 1.5–2 weeks, dominated by Phase 3 — which came in well under that, because every
 address turned out to be reachable from a name the binary still carries rather than by signature

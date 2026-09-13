@@ -6,11 +6,13 @@ using Ap.Control.Utils.Interfaces;
 using Ap.Control.Memory;
 using Ap.Control.Memory.Mac;
 using Ap.Control.SaveFile;
+using Ap.Control.Setup;
 using Ap.Control.Utils.Save;
 
 if (args.Length > 0 && args[0] == "dump-save") return DumpSave(args);
 if (args.Length > 0 && args[0] == "probe-game") return ProbeGame(args);
 if (args.Length > 0 && args[0] == "try-unlock") return TryUnlock(args);
+if (args.Length > 0 && args[0] == "install-launcher") return InstallLauncher(args);
 
 return await RunClientAsync(args);
 
@@ -31,11 +33,12 @@ static async Task<int> RunClientAsync(string[] args)
         Console.WriteLine(
             "Usage: Ap.Control [--server <url> --username <name> [--password <pass>]]\n" +
             "                  [--source memory|file] [--save <path>] [--items <apitems.json>]\n" +
-            "                  [--ui-port <n>] [--no-ui]\n" +
+            "                  [--ui-port <n>] [--no-ui] [--launch [--game <Game.app>]]\n" +
             "       Ap.Control dump-save [<path>]\n" +
             "       Ap.Control probe-game [--layout [<rtti-name>]] [--snapshot <path>]\n" +
             "       Ap.Control try-unlock weapon-slot | mod-slot <0-3>\n" +
-            "                            | ability <gid> | item <gid> [<amount>]\n\n" +
+            "                            | ability <gid> | item <gid> [<amount>]\n" +
+            "       Ap.Control install-launcher\n\n" +
             "With --server and --username the client connects on startup as before. Without them it\n" +
             "waits for the in-game Archipelago page to supply the details.\n\n" +
             "dump-save parses a save and prints the location checks it would report, without\n" +
@@ -48,7 +51,11 @@ static async Task<int> RunClientAsync(string[] args)
             "its own, like an item count. macOS only.\n\n" +
             "try-unlock calls one of the mapped game functions in the running game, to confirm the\n" +
             "address found by reading the binary is the function it looks like. It changes your\n" +
-            "game, and the two unlock functions save themselves. macOS only.");
+            "game, and the two unlock functions save themselves. macOS only.\n\n" +
+            "install-launcher writes the helper library and the Steam launch wrapper into\n" +
+            "Application Support and prints the launch option to paste into Steam. --launch starts\n" +
+            "Control directly with the helper loaded, skipping Steam; handy while developing, but\n" +
+            "Steam is the supported path because it keeps the overlay and cloud saves. macOS only.");
         return 0;
     }
 
@@ -56,6 +63,23 @@ static async Task<int> RunClientAsync(string[] args)
     {
         Console.Error.WriteLine($"[ui] --ui-port must be a number, got '{portText}'");
         return 1;
+    }
+
+    // Start the game ourselves, if asked. Before anything else connects, so the shim's socket is
+    // there by the time the granters look for it rather than a few seconds later.
+    if (args.Contains("--launch") && OperatingSystem.IsMacOS())
+    {
+        if (MacInstaller.IsGameRunning())
+        {
+            Console.WriteLine("--launch: Control is already running; attaching to it instead.");
+        }
+        else
+        {
+            (bool ok, string? problem) = MacInstaller.Launch(Arg("--game"));
+            Console.WriteLine(ok
+                ? "--launch: started Control with the Archipelago helper loaded."
+                : $"[warning] --launch: {problem}");
+        }
     }
 
     // Which levers reach the game depends on the platform. On Windows the client drives the game
@@ -268,6 +292,76 @@ static int DumpSave(string[] args)
     Console.WriteLine($"\n{total} check(s) would be sent. Whether the server accepts each one "
         + "depends on the generated world having that location id.");
     return 0;
+}
+
+/// <summary>
+/// Write the helper library and the Steam launch wrapper into Application Support, and say what to
+/// do with them.
+///
+/// Prints the launch-option line and puts it on the clipboard, because it contains the player's home
+/// directory and a space, and a mistyped one fails by the game simply starting unmodified — which
+/// looks like the client being broken rather than like a typo.
+/// </summary>
+static int InstallLauncher(string[] args)
+{
+    if (!OperatingSystem.IsMacOS())
+    {
+        Console.Error.WriteLine(
+            "install-launcher sets up the macOS helper; on this platform the client drives the game "
+            + "directly and there is nothing to install.");
+        return 1;
+    }
+
+    MacInstaller.Result result = MacInstaller.Install();
+
+    if (!result.Ok)
+    {
+        Console.Error.WriteLine($"install-launcher: {result.Problem}");
+        return 1;
+    }
+
+    Console.WriteLine($"Installed to {result.Directory}");
+    Console.WriteLine($"  {MacInstaller.WrapperName}");
+    Console.WriteLine(result.WroteDylib
+        ? $"  {MacInstaller.DylibName}"
+        : $"  {MacInstaller.DylibName} — NOT written; {result.Problem}");
+
+    Console.WriteLine();
+    Console.WriteLine("Set this as Control's launch options in Steam");
+    Console.WriteLine("(right-click Control → Properties → General → Launch Options):");
+    Console.WriteLine();
+    Console.WriteLine($"  {MacInstaller.LaunchOption}");
+    Console.WriteLine();
+
+    if (CopyToClipboard(MacInstaller.LaunchOption))
+        Console.WriteLine("That line is on your clipboard — paste it and close the properties window.");
+
+    // The one thing a player cannot deduce: an install under a running game is invisible to it,
+    // because the copy it mapped at launch is the copy it keeps.
+    if (result.GameRunning)
+    {
+        Console.WriteLine();
+        Console.WriteLine("Control is running with an older helper already loaded. It will go on");
+        Console.WriteLine("using that one — quit it and start it again for this install to take effect.");
+    }
+
+    return 0;
+}
+
+/// <summary>Put text on the clipboard with pbcopy. False if it is not available.</summary>
+static bool CopyToClipboard(string text)
+{
+    try
+    {
+        using System.Diagnostics.Process? pbcopy = System.Diagnostics.Process.Start(
+            new System.Diagnostics.ProcessStartInfo("/usr/bin/pbcopy") { RedirectStandardInput = true });
+        if (pbcopy is null) return false;
+
+        pbcopy.StandardInput.Write(text);
+        pbcopy.StandardInput.Close();
+        return pbcopy.WaitForExit(5000) && pbcopy.ExitCode == 0;
+    }
+    catch { return false; }
 }
 
 /// <summary>
