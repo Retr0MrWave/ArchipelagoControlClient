@@ -239,6 +239,68 @@ std::string op_scan(uint64_t id, const std::vector<std::string>& args) {
         .str();
 }
 
+/// keys <pre> <post> <limit> <v1> [v2 ...]
+///
+/// Built for GameFlow reconciliation: find every 4-aligned occurrence of any of a set of name
+/// hashes, and return each hit WITH the bytes around it so the client can tell a live map node
+/// from a stale snapshot copy without a round trip per hit. Two dozen variables, once a second,
+/// would otherwise be either two dozen full sweeps or hundreds of reads.
+///
+/// The window travels in one binary frame of fixed-size records: u32 value, u32 padding, u64
+/// address, then pre+post bytes starting at address-pre.
+std::string op_keys(uint64_t id, const std::vector<std::string>& args, std::vector<uint8_t>& body) {
+    if (args.size() < 6) return fail(id, "usage: keys <pre> <post> <limit> <value> [value ...]");
+
+    size_t pre = static_cast<size_t>(number(args[2]));
+    size_t post = static_cast<size_t>(number(args[3]));
+    size_t window = pre + post;
+    if (window == 0 || window > 4096) return fail(id, "the window must be 1 to 4096 bytes");
+
+    size_t limit = static_cast<size_t>(number(args[4]));
+    if (limit == 0 || limit > kMaxScanHits) limit = kMaxScanHits;
+
+    std::vector<uint32_t> targets;
+    for (size_t i = 5; i < args.size(); ++i)
+        targets.push_back(static_cast<uint32_t>(number(args[i])));
+
+    bool truncated = false;
+    std::vector<memory::KeyHit> hits = memory::scan_u32(targets, limit, &truncated);
+
+    body.clear();
+    body.reserve(hits.size() * (16 + window));
+    std::vector<uint8_t> scratch(window);
+
+    uint64_t kept = 0;
+    for (const memory::KeyHit& hit : hits) {
+        if (hit.address < pre) continue;
+        // A window that runs off the end of a mapping cannot belong to a live node, so a failed
+        // read here is a filter rather than an error.
+        if (memory::read(hit.address - pre, scratch.data(), window) != window) continue;
+
+        uint32_t value = hit.value;
+        uint32_t padding = 0;
+        uint64_t address = hit.address;
+        auto append = [&body](const void* from, size_t len) {
+            const auto* at = static_cast<const uint8_t*>(from);
+            body.insert(body.end(), at, at + len);
+        };
+        append(&value, sizeof value);
+        append(&padding, sizeof padding);
+        append(&address, sizeof address);
+        append(scratch.data(), scratch.size());
+        ++kept;
+    }
+
+    return json::Object()
+        .num("id", id)
+        .flag("ok", true)
+        .num("count", kept)
+        .num("pre", pre)
+        .num("post", post)
+        .flag("truncated", truncated)
+        .str();
+}
+
 std::string op_call(uint64_t id, const std::vector<std::string>& args) {
     // call <fn> <x0..x7> <d0..d7> <timeout_ms>
     if (args.size() < 20) return fail(id, "usage: call <fn> <x0..x7> <d0..d7> <timeout-ms>");
@@ -335,6 +397,10 @@ bool handle(int fd, const std::string& line) {
         }
     } else if (op == "scan") {
         send_json(op_scan(id, args));
+    } else if (op == "keys") {
+        std::vector<uint8_t> body;
+        send_json(op_keys(id, args, body));
+        if (!body.empty()) send_frame(kBinary, body.data(), body.size());
     } else if (op == "call") {
         send_json(op_call(id, args));
     } else {

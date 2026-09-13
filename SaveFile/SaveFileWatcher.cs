@@ -20,6 +20,7 @@ namespace Ap.Control.SaveFile
 
         private FileSystemWatcher? _fsw;
         private Timer? _debounce;
+        private Timer? _awaitDirectory;
         private ControlSave? _current;
         private ulong _lastHash;
         private bool _started;
@@ -84,22 +85,62 @@ namespace Ap.Control.SaveFile
             }
 
             _debounce = new Timer(_ => _ = ProcessChangeAsync(), null, Timeout.Infinite, Timeout.Infinite);
-            _fsw = new FileSystemWatcher(_directory, _fileName)
+            Attach();
+        }
+
+        /// <summary>
+        /// Start watching, or arrange to start once the directory exists.
+        ///
+        /// A save directory that is not there yet is an ordinary state, not an error: a player who
+        /// has never saved this game does not have one, and on macOS the client defaults to the
+        /// file source, so this is the first run of every new installation. FileSystemWatcher throws
+        /// on a missing directory, which would take the whole client down over it.
+        /// </summary>
+        private void Attach()
+        {
+            if (_disposed || _fsw is not null) return;
+
+            if (!Directory.Exists(_directory))
+            {
+                _awaitDirectory ??= new Timer(_ => Attach(), null, DirectoryPollMs, DirectoryPollMs);
+                return;
+            }
+
+            var watcher = new FileSystemWatcher(_directory, _fileName)
             {
                 NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size
                              | NotifyFilters.FileName | NotifyFilters.CreationTime,
                 IncludeSubdirectories = false,
             };
-            _fsw.Changed += OnFsEvent;
-            _fsw.Created += OnFsEvent;
-            _fsw.Renamed += OnFsEvent;
-            _fsw.EnableRaisingEvents = true;
+            watcher.Changed += OnFsEvent;
+            watcher.Created += OnFsEvent;
+            watcher.Renamed += OnFsEvent;
+            watcher.EnableRaisingEvents = true;
+            _fsw = watcher;
+
+            Timer? waiting = Interlocked.Exchange(ref _awaitDirectory, null);
+            waiting?.Dispose();
+
+            // The save may have appeared while we were waiting for its folder.
+            _debounce?.Change(_debounceMs, Timeout.Infinite);
         }
+
+        /// <summary>How often to look for a save directory that does not exist yet.</summary>
+        private const int DirectoryPollMs = 5000;
 
         private void OnFsEvent(object sender, FileSystemEventArgs e)
         {
             _debounce?.Change(_debounceMs, Timeout.Infinite);
         }
+
+        /// <summary>
+        /// Look at the save again shortly, as if the filesystem had reported a change.
+        ///
+        /// For callers that know a save is coming before the filesystem does — on macOS the shim
+        /// sees the game's own saveGame call. Harmless if nothing changed: the content hash decides
+        /// whether anything is dispatched.
+        /// </summary>
+        public void RequestRescan() => _debounce?.Change(_debounceMs, Timeout.Infinite);
 
         private async Task ProcessChangeAsync()
         {
@@ -227,6 +268,7 @@ namespace Ap.Control.SaveFile
                 _fsw.Renamed -= OnFsEvent;
                 _fsw.Dispose();
             }
+            Interlocked.Exchange(ref _awaitDirectory, null)?.Dispose();
             _debounce?.Dispose();
             _gate.Dispose();
             _cts.Dispose();

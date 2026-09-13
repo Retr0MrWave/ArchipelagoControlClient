@@ -31,33 +31,19 @@ namespace Ap.Control.Memory
 
         public const int MaxClearance = 6;
 
-        // GlobalVariable node layout, relative to the key-hash address:
-        private const int OFF_TYPE = 0x08;   // u32 GameFlowType (0 bool / 1 int / 2 float)
-        private const int OFF_VALUE = 0x10;  // u64 value slot (bool 0/1, int, or float bits)
-        private const int PRE = 0x20;        // bytes before the key we inspect for the tree pointers
-
-        // User-mode heap pointer range on x64 (used to recognise the tree-node prefix).
-        private const ulong PTR_MIN = 0x0000_0100_0000_0000;
-        private const ulong PTR_MAX = 0x0000_7FFF_FFFF_FFFF;
+        // GlobalVariable node layout, relative to the key-hash address. The knowledge itself lives
+        // in GameFlowNodes, which the macOS controller shares; these are local aliases so the code
+        // below reads as it always did.
+        private const int OFF_TYPE = GameFlowNodes.OffType;
+        private const int OFF_VALUE = GameFlowNodes.OffValue;
+        private const int PRE = GameFlowNodes.Pre;
 
         private IntPtr _hProc;
 
         public bool IsOpen => _hProc != IntPtr.Zero;
 
-        /// <summary>
-        /// Key hash of a GameFlow variable = <c>r::makeStringCRC32(name)</c>: standard (zlib/ISO-HDLC)
-        /// CRC32 over the ASCII-lower-cased name.
-        /// </summary>
-        public static uint KeyHash(string name)
-        {
-            uint c = 0xFFFFFFFF;
-            foreach (char ch in name)
-            {
-                byte b = (byte)(ch is >= 'A' and <= 'Z' ? ch + 32 : ch);   // ASCII tolower
-                c = Crc32Table[(c ^ b) & 0xFF] ^ (c >> 8);
-            }
-            return ~c;
-        }
+        /// <inheritdoc cref="GameFlowNodes.KeyHash"/>
+        public static uint KeyHash(string name) => GameFlowNodes.KeyHash(name);
 
         public void Start()
         {
@@ -301,21 +287,9 @@ namespace Ap.Control.Memory
 
         // Decide map node vs snapshot from an in-memory window. <paramref name="keyIdx"/> is the byte
         // offset of the key hash within <paramref name="buf"/>; bytes [keyIdx-PRE .. keyIdx+OFF_VALUE+8)
-        // must be present. A live map node has three heap pointers (_Left/_Parent/_Right) just before
-        // the key; a snapshot has none.
+        // must be present.
         private static GvmScanHit ClassifyBytes(byte[] buf, int keyIdx, long keyAddr)
-        {
-            int tree = 0;
-            for (int q = 0; q < 3; q++)
-            {
-                ulong p = BitConverter.ToUInt64(buf, keyIdx - PRE + q * 8);
-                if (p is >= PTR_MIN and <= PTR_MAX) tree++;
-            }
-            uint type = BitConverter.ToUInt32(buf, keyIdx + OFF_TYPE);
-            ulong val = BitConverter.ToUInt64(buf, keyIdx + OFF_VALUE);
-            var t = type <= 2 ? (GameFlowType)type : GameFlowType.Other;
-            return new GvmScanHit(keyAddr, keyAddr + OFF_VALUE, tree >= 2, t, val);
-        }
+            => GameFlowNodes.Classify(buf, keyIdx, keyAddr, PointerRange.Windows);
 
         private void EnsureOpen()
         {
@@ -327,21 +301,5 @@ namespace Ap.Control.Memory
             MemoryHelper.CloseHandleSafe(_hProc);
             _hProc = IntPtr.Zero;
         }
-
-        // --- CRC32 (0xEDB88320, reflected) --------------------------------------------------------
-        private static readonly uint[] Crc32Table = BuildCrc32Table();
-        private static uint[] BuildCrc32Table()
-        {
-            var t = new uint[256];
-            for (uint n = 0; n < 256; n++)
-            {
-                uint c = n;
-                for (int k = 0; k < 8; k++)
-                    c = (c & 1) != 0 ? 0xEDB88320 ^ (c >> 1) : c >> 1;
-                t[n] = c;
-            }
-            return t;
-        }
-
     }
 }

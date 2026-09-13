@@ -35,4 +35,16 @@ size_t write(uint64_t addr, const void* data, size_t len);
 std::vector<uint64_t> scan(const std::vector<uint8_t>& pattern, size_t align, size_t lookahead,
                            size_t limit, bool* truncated);
 
+struct KeyHit {
+    uint32_t value = 0;
+    uint64_t address = 0;
+};
+
+/// One sweep that finds every 4-byte-aligned occurrence of ANY of a set of 32-bit values.
+///
+/// This exists for GameFlow reconciliation, which asks about two dozen variables at a time, each
+/// identified by a CRC32 of its name. Doing that as two dozen separate pattern scans would walk
+/// the whole heap two dozen times, once a second, for the entire session.
+std::vector<KeyHit> scan_u32(const std::vector<uint32_t>& targets, size_t limit, bool* truncated);
+
 }  // namespace ap::memory

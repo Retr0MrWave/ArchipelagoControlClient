@@ -4,6 +4,7 @@ using Ap.Control.Ui;
 using Ap.Control.Utils;
 using Ap.Control.Utils.Interfaces;
 using Ap.Control.Memory;
+using Ap.Control.Memory.Mac;
 using Ap.Control.SaveFile;
 
 return await RunClientAsync(args);
@@ -37,9 +38,23 @@ static async Task<int> RunClientAsync(string[] args)
         return 1;
     }
 
-    await using var granter = new NativeItemGranter();
-    await using var abilityGranter = new NativeAbilityGranter();
-    using var gameflow = new NativeGameFlowController();
+    // Which levers reach the game depends on the platform. On Windows the client drives the game
+    // from outside, through process-memory APIs; on macOS it drives a helper dylib loaded inside
+    // the game, because that is the only approach the platform's security model actually welcomes.
+    // Everything above this line - the Archipelago session, the item map, the UI bridge, the save
+    // parser - is the same code on both.
+    var shim = OperatingSystem.IsMacOS() ? new ShimClient() : null;
+
+    await using IItemGranter granter = shim is null
+        ? new NativeItemGranter()
+        : new MacItemGranter(shim);
+    await using IAbilityGranter abilityGranter = shim is null
+        ? new NativeAbilityGranter()
+        : new MacAbilityGranter(shim);
+    using IDisposable gameflowLifetime = shim is null
+        ? new NativeGameFlowController()
+        : new MacGameFlowController(shim);
+    var gameflow = (IGameFlowController)gameflowLifetime;
 
     ApItemMap itemMap;
     try
@@ -71,7 +86,9 @@ static async Task<int> RunClientAsync(string[] args)
         Console.Error.WriteLine($"[item-map] failed to load: {e.Message}");
         return 1;
     }
-    Console.WriteLine(GameBuildRegistry.StartupBanner());
+    Console.WriteLine(shim is null
+        ? GameBuildRegistry.StartupBanner()
+        : MacGameBuildRegistry.Describe(shim.EnsureConnected() ? shim.Hello() : null));
 
     var relay = new SaveNotifierRelay();
     using var session = new ApSessionHost(granter, abilityGranter, gameflow, itemMap, relay);
@@ -118,11 +135,37 @@ static async Task<int> RunClientAsync(string[] args)
             Console.WriteLine("Waiting for the in-game Archipelago page to supply connection details...");
         }
 
-        bool useFile = string.Equals(source, "file", StringComparison.OrdinalIgnoreCase);
-        ISaveWatcher watcher = useFile
-            ? new SaveFileWatcher(savePath ?? Path.Combine(AppContext.BaseDirectory, "samples", "persistent.chunk"))
-            : new SaveMemoryWatcher();
-        Console.WriteLine(useFile ? "Save source: file" : "Save source: process memory (Control_DX12)");
+        // The memory-backed watcher is a Windows implementation (it opens another process). On
+        // macOS the save is read from disk, which is where it wants to be read from anyway - the
+        // shim only has to say when to look.
+        bool useFile = string.Equals(source, "file", StringComparison.OrdinalIgnoreCase)
+                       || (source is null && OperatingSystem.IsMacOS());
+
+        ISaveWatcher watcher;
+        if (useFile)
+        {
+            string path = savePath
+                ?? (OperatingSystem.IsMacOS()
+                    ? MacSaveLocations.Preferred()
+                    : Path.Combine(AppContext.BaseDirectory, "samples", "persistent.chunk"));
+
+            var fileWatcher = new SaveFileWatcher(path);
+            watcher = fileWatcher;
+
+            Console.WriteLine(File.Exists(path)
+                ? $"Save source: file ({path})"
+                : $"Save source: file ({path}) — not there yet; it will be picked up when the game "
+                  + "first saves. Pass --save if yours lives elsewhere.");
+
+            // The shim sees the game call saveGame, which beats waiting for the filesystem to
+            // notice and beats the fixed poll the Windows client falls back on.
+            if (shim is not null) shim.SaveRequested += fileWatcher.RequestRescan;
+        }
+        else
+        {
+            watcher = new SaveMemoryWatcher();
+            Console.WriteLine("Save source: process memory (Control_DX12)");
+        }
 
         using (watcher)
         {

@@ -7,13 +7,20 @@
     <Nullable>enable</Nullable>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
 
-    <!-- The RID lives here rather than on the CI command line on purpose. A self-contained publish
+    <!-- The RIDs live here rather than on the CI command line on purpose. A self-contained publish
          infers a RID even when none is given, and a RID-specific restore REWRITES packages.lock.json
          to add a "net10.0/win-x64" target. A later restore in locked mode that evaluates without a
          RID then sees a lock file it disagrees with and fails NU1004. Making it a project property
-         means every restore, build and publish (local, CI, Debug, Release) evaluates the same RID,
-         so the lock file stays valid. -->
-    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+         means every restore, build and publish (local, CI, Debug, Release) evaluates the same set,
+         so the lock file stays valid.
+
+         RuntimeIdentifiers (plural) is that set, and is deliberately host-independent: restoring on
+         Windows and on macOS has to compute the same lock-file targets. RuntimeIdentifier (singular)
+         only picks which member this build produces - SelfContained needs exactly one - and defaults
+         to the host's, so `dotnet build` does the obvious thing on either machine. -->
+    <RuntimeIdentifiers>win-x64;osx-arm64</RuntimeIdentifiers>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == '' and $([MSBuild]::IsOSPlatform('OSX'))">osx-arm64</RuntimeIdentifier>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
     <!-- Players should not have to install the .NET runtime to run the client. -->
     <SelfContained>true</SelfContained>
 

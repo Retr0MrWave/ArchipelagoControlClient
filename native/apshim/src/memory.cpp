@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <unordered_set>
 
 namespace ap::memory {
 namespace {
@@ -144,6 +145,41 @@ std::vector<uint64_t> scan(const std::vector<uint8_t>& pattern, size_t align, si
                 if (std::memcmp(&window[i], pattern.data(), pattern.size()) != 0) continue;
 
                 hits.push_back(first_addr + i);
+                if (hits.size() >= limit) {
+                    if (truncated) *truncated = true;
+                    return hits;
+                }
+            }
+        }
+    }
+    return hits;
+}
+
+std::vector<KeyHit> scan_u32(const std::vector<uint32_t>& targets, size_t limit, bool* truncated) {
+    std::vector<KeyHit> hits;
+    if (truncated) *truncated = false;
+    if (targets.empty()) return hits;
+
+    const std::unordered_set<uint32_t> wanted(targets.begin(), targets.end());
+
+    // No window overlap is needed: region bases are page-aligned and the window is a whole number
+    // of words, so a 4-aligned value can never straddle two reads.
+    std::vector<uint8_t> window(1u << 20);
+
+    for (const Region& region : regions(/*candidates_only=*/true)) {
+        for (uint64_t offset = 0; offset < region.size; offset += window.size()) {
+            size_t want = static_cast<size_t>(
+                std::min<uint64_t>(window.size(), region.size - offset));
+            size_t got = read(region.base + offset, window.data(), want);
+            if (got < sizeof(uint32_t)) break;
+
+            uint64_t first_addr = region.base + offset;
+            for (size_t i = 0; i + sizeof(uint32_t) <= got; i += 4) {
+                uint32_t value;
+                std::memcpy(&value, &window[i], sizeof value);
+                if (wanted.find(value) == wanted.end()) continue;
+
+                hits.push_back(KeyHit { value, first_addr + i });
                 if (hits.size() >= limit) {
                     if (truncated) *truncated = true;
                     return hits;
