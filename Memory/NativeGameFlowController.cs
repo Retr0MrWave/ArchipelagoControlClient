@@ -190,14 +190,14 @@ namespace Ap.Control.Memory
         /// <summary>
         /// Writes raw value to every live map node of the variable. Returns the number of nodes written.
         /// </summary>
-        public int SetRaw(string name, ulong raw)
+        public int SetRaw(string name, ulong raw, GameFlowType expectType)
         {
             if (!EnsureStarted()) return 0;
             byte[] data = BitConverter.GetBytes(raw);
             uint keyHash = KeyHash(name);
             int n = 0;
             foreach (var h in FindLive(name))
-                if (WriteNode(h.KeyAddress, keyHash, data)) n++;
+                if (WriteNode(h.KeyAddress, keyHash, data, expectType)) n++;
             return n;
         }
 
@@ -218,7 +218,7 @@ namespace Ap.Control.Memory
             {
                 byte[] data = BitConverter.GetBytes(wanted[keyHash]);
                 foreach (long keyAddr in nodes)
-                    if (WriteNode(keyAddr, keyHash, data)) n++;
+                    if (WriteNode(keyAddr, keyHash, data, GameFlowType.Bool)) n++;
             }
             return n;
         }
@@ -226,7 +226,12 @@ namespace Ap.Control.Memory
         /// <summary>
         /// Write a node's value slot after re-confirming the node is still there.
         /// </summary>
-        private bool WriteNode(long keyAddr, uint expectKeyHash, byte[] data)
+        /// <param name="expectType">
+        /// The type the variable must declare. A node that declares anything else is not the
+        /// variable being written but the name hash turning up by chance in memory shaped like a
+        /// node, and writing to it would corrupt whatever actually lives there.
+        /// </param>
+        private bool WriteNode(long keyAddr, uint expectKeyHash, byte[] data, GameFlowType expectType)
         {
             var win = new byte[PRE + 0x20];
             if (!MemoryHelper.TryReadBytes(_hProc, (IntPtr)(keyAddr - PRE), win, win.Length, out int read)
@@ -234,8 +239,11 @@ namespace Ap.Control.Memory
                 return false;                                          // unmapped since the scan
             if (BitConverter.ToUInt32(win, PRE) != expectKeyHash)
                 return false;                                          // reused by something else
-            if (!ClassifyBytes(win, PRE, keyAddr).IsMapNode)
+            GvmScanHit node = ClassifyBytes(win, PRE, keyAddr);
+            if (!node.IsMapNode)
                 return false;                                          // no longer a live tree node
+            if (node.Type != expectType)
+                return false;                                          // a coincidence, not the variable
 
             try
             {
@@ -248,9 +256,10 @@ namespace Ap.Control.Memory
             }
         }
 
-        public int SetBool(string name, bool value) => SetRaw(name, value ? 1UL : 0UL);
-        public int SetInt(string name, int value) => SetRaw(name, (uint)value);
-        public int SetFloat(string name, float value) => SetRaw(name, BitConverter.SingleToUInt32Bits(value));
+        public int SetBool(string name, bool value) => SetRaw(name, value ? 1UL : 0UL, GameFlowType.Bool);
+        public int SetInt(string name, int value) => SetRaw(name, (uint)value, GameFlowType.Int);
+        public int SetFloat(string name, float value)
+            => SetRaw(name, BitConverter.SingleToUInt32Bits(value), GameFlowType.Float);
 
         // --- IGameFlowController -----------------------------------------------------------------
 

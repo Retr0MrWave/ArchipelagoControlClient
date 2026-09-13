@@ -56,9 +56,22 @@ namespace Ap.Control.Memory
             return ~c;
         }
 
+        /// <summary>Offset of the red-black colour flag, relative to the key.</summary>
+        public const int OffColour = -0x08;
+
         /// <summary>
         /// Classify a key-hash hit from a window of memory around it. A live map node has three
-        /// heap pointers just before the key; a snapshot has none.
+        /// tree slots just before the key; a snapshot has none.
+        ///
+        /// Be strict here. The scan that produces these hits looks for a 32-bit hash at every
+        /// 4-byte boundary of every writable page, so across a few hundred megabytes of heap a
+        /// handful of coincidental matches per sweep is normal, and callers write eight bytes into
+        /// whatever this approves. The dangerous neighbourhood is pointer-dense memory — an
+        /// Objective-C autorelease pool page is a solid array of heap pointers, so "some words
+        /// nearby look like pointers" is satisfied nearly everywhere inside one. Hence the two
+        /// cheap structural rules below on top of the pointer count; callers that write should
+        /// also check <see cref="GvmScanHit.Type"/> and, where reads are cheap, follow the parent
+        /// link back.
         /// </summary>
         /// <param name="window">Bytes starting <see cref="Pre"/> before the key.</param>
         /// <param name="keyIndex">Offset of the key hash within <paramref name="window"/>.</param>
@@ -66,17 +79,27 @@ namespace Ap.Control.Memory
         public static GvmScanHit Classify(ReadOnlySpan<byte> window, int keyIndex, long keyAddress,
             PointerRange pointers)
         {
+            // Every tree slot must be a pointer or empty. A slot holding something that is neither
+            // rules the node out, where merely counting the plausible ones would have let it pass.
             int treePointers = 0;
+            bool slotsPlausible = true;
             for (int q = 0; q < 3; q++)
             {
                 ulong candidate = BitConverter.ToUInt64(window[(keyIndex - Pre + q * 8)..]);
+                if (candidate == 0) continue;                       // an absent child
                 if (pointers.Contains(candidate)) treePointers++;
+                else slotsPlausible = false;
             }
+
+            // The colour is a bool — 0 or 1 — on both standard libraries (libc++ __is_black_,
+            // MSVC _Color), and it shares its word with padding either way.
+            bool colourPlausible = window[keyIndex + OffColour] <= 1;
 
             uint type = BitConverter.ToUInt32(window[(keyIndex + OffType)..]);
             ulong value = BitConverter.ToUInt64(window[(keyIndex + OffValue)..]);
 
-            return new GvmScanHit(keyAddress, keyAddress + OffValue, treePointers >= 2,
+            return new GvmScanHit(keyAddress, keyAddress + OffValue,
+                slotsPlausible && colourPlausible && treePointers >= 2,
                 type <= 2 ? (GameFlowType)type : GameFlowType.Other, value);
         }
 
