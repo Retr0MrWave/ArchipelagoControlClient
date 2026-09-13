@@ -1,6 +1,34 @@
 namespace Ap.Control.Memory.Mac
 {
     /// <summary>
+    /// Where the fields the inventory scan reads sit inside GameInventoryComponentState.
+    ///
+    /// These come from the Windows build, and clang has no reason to lay the class out differently:
+    /// same declaration order, same member types, and nothing here is a <c>long</c>, which is the
+    /// one scalar whose width differs between the two compilers. "No reason to" is not "does not",
+    /// though, so the scan treats them as a claim to be checked rather than a fact — every
+    /// candidate has to carry a plausible network role at <see cref="NetRole"/> before it is
+    /// believed. A build that moved these fields produces no candidates and says so, instead of
+    /// reading a byte from the middle of some other member and acting on it.
+    /// </summary>
+    public sealed record InventoryLayout
+    {
+        /// <summary>Byte flag, 1 on the player's own inventory.</summary>
+        public int IsPlayer { get; init; } = 0x90;
+
+        /// <summary>u64 whose top two bits are the network role: 3 authoritative, 2 replica.</summary>
+        public int NetRole { get; init; } = 0x18;
+
+        /// <summary>u32 count of regular items — the size of the vector at +0x40.</summary>
+        public int ItemCount { get; init; } = 0x48;
+
+        /// <summary>How far into an object the scan has to read to see all three.</summary>
+        public int WindowSize => Math.Max(IsPlayer + 1, Math.Max(NetRole + 8, ItemCount + 4));
+
+        public static InventoryLayout Default { get; } = new();
+    }
+
+    /// <summary>
     /// The addresses the macOS client needs that it cannot resolve by name.
     ///
     /// Far smaller than its Windows counterpart, because most of what <see cref="GameBuildProfile"/>
@@ -33,6 +61,15 @@ namespace Ap.Control.Memory.Mac
 
         /// <summary>The script-facing UnlockCharacterModSlot.</summary>
         public long UnlockCharacterModSlot { get; init; }
+
+        // --- struct layout ----------------------------------------------------------------------
+
+        /// <summary>
+        /// Where the inventory scan's fields sit. Unlike the addresses above this is not per-build
+        /// in practice, but it is declared per-build anyway so a game update that moves a member
+        /// can be corrected here rather than in code shared with Windows.
+        /// </summary>
+        public InventoryLayout Inventory { get; init; } = InventoryLayout.Default;
 
         /// <summary>Which of the above are still unmapped, for an error a player can act on.</summary>
         public IReadOnlyList<string> MissingAddresses()

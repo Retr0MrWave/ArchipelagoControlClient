@@ -115,6 +115,13 @@ size_t write(uint64_t addr, const void* data, size_t len) {
     return kr == KERN_SUCCESS ? len : 0;
 }
 
+bool is_executable(uint64_t addr) {
+    if (addr == 0 || addr >= kUserSpaceLimit) return false;
+
+    Region region {};
+    return region_of(addr, region) && (region.protection & VM_PROT_EXECUTE) != 0;
+}
+
 std::vector<uint64_t> scan(const std::vector<uint8_t>& pattern, size_t align, size_t lookahead,
                            size_t limit, bool* truncated) {
     std::vector<uint64_t> hits;

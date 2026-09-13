@@ -9,6 +9,7 @@ using Ap.Control.SaveFile;
 using Ap.Control.Utils.Save;
 
 if (args.Length > 0 && args[0] == "dump-save") return DumpSave(args);
+if (args.Length > 0 && args[0] == "probe-game") return ProbeGame();
 
 return await RunClientAsync(args);
 
@@ -30,11 +31,14 @@ static async Task<int> RunClientAsync(string[] args)
             "Usage: Ap.Control [--server <url> --username <name> [--password <pass>]]\n" +
             "                  [--source memory|file] [--save <path>] [--items <apitems.json>]\n" +
             "                  [--ui-port <n>] [--no-ui]\n" +
-            "       Ap.Control dump-save [<path>]\n\n" +
+            "       Ap.Control dump-save [<path>]\n" +
+            "       Ap.Control probe-game\n\n" +
             "With --server and --username the client connects on startup as before. Without them it\n" +
             "waits for the in-game Archipelago page to supply the details.\n\n" +
             "dump-save parses a save and prints the location checks it would report, without\n" +
-            "connecting to anything. With no path it looks where the client would look.");
+            "connecting to anything. With no path it looks where the client would look.\n\n" +
+            "probe-game asks the running game what the client can see of it: the build, whether the\n" +
+            "pump is ticking, and whether the player's inventory can be found. macOS only.");
         return 0;
     }
 
@@ -253,6 +257,89 @@ static int DumpSave(string[] args)
               + diff.NewUnlockedControlPoints.Count + diff.NewCollectibles.Count + completed.Length;
     Console.WriteLine($"\n{total} check(s) would be sent. Whether the server accepts each one "
         + "depends on the generated world having that location id.");
+    return 0;
+}
+
+/// <summary>
+/// Ask the running game what the client can see of it, and print the answer.
+///
+/// The macOS granters fail with a sentence rather than a stack trace — "this build is not mapped",
+/// "is a save loaded?" — which is right for a player mid-session and useless for working out which
+/// of the several things behind that sentence is actually the problem. This runs each step in
+/// order and prints what it got: the shim answering, the build identified, the RTTI walk finding a
+/// vtable, the heap sweep finding objects, the player flag narrowing them, the network role
+/// picking one. Whichever line stops being plausible is the one to look at.
+///
+/// It is also how the inventory scan is confirmed to survive a save load: run it, load a save, run
+/// it again.
+/// </summary>
+static int ProbeGame()
+{
+    if (!OperatingSystem.IsMacOS())
+    {
+        Console.Error.WriteLine(
+            "probe-game talks to the macOS helper dylib; this platform drives the game directly.");
+        return 1;
+    }
+
+    using var shim = new ShimClient();
+    if (!shim.EnsureConnected() || shim.Hello() is not { } hello)
+    {
+        Console.Error.WriteLine($"probe-game: nothing is listening on {shim.SocketPath}.");
+        Console.Error.WriteLine(
+            "Start Control with the Archipelago launch option set and try again. If it is running, "
+            + "check ~/Library/Logs/Ap.Control/shim.log to see whether the dylib loaded.");
+        return 1;
+    }
+
+    Console.WriteLine($"Shim:  connected on {shim.SocketPath} (game pid {hello.Pid})");
+    Console.WriteLine(hello.PumpTicking
+        ? $"Pump:  ticking, {hello.Beats:N0} frame(s) so far"
+        : $"Pump:  not ticking, {hello.Beats:N0} frame(s) so far — at a menu or paused, so anything "
+          + "that has to run on the game's own thread will wait for gameplay");
+    if (hello.Executable is { } game)
+        Console.WriteLine($"Image: {game.Name} {game.Uuid} loaded at 0x{game.Base:x}");
+    Console.WriteLine(MacGameBuildRegistry.Describe(hello));
+
+    // The RTTI walk. Both classes are reported because the second is what the ability grants will
+    // need in Phase 3, and a build that renamed either is worth knowing about now.
+    Console.WriteLine();
+    foreach (string rttiName in new[] { MacPlayerInventory.RttiName, "30PlayerPropertiesComponentState" })
+    {
+        ShimVtableLookup lookup = shim.Vtables(rttiName);
+        Console.WriteLine(lookup.Error is { } error
+            ? $"RTTI {rttiName}: {error}"
+            : $"RTTI {rttiName}: " + string.Join(", ", lookup.Vtables.Select(v =>
+                $"0x{v.Address:x}{(v.IsPrimary ? " (primary)" : $" (offset_to_top {v.OffsetToTop})")}")));
+    }
+
+    InventoryLayout layout = MacGameBuildRegistry.Resolve(hello)?.Inventory ?? InventoryLayout.Default;
+    var inventory = new MacPlayerInventory(shim);
+
+    var clock = System.Diagnostics.Stopwatch.StartNew();
+    MacPlayerInventory.Survey survey = inventory.Scan(layout);
+    clock.Stop();
+
+    Console.WriteLine();
+    Console.WriteLine($"Inventory scan ({clock.ElapsedMilliseconds:N0} ms): {survey.Instances} object(s) "
+        + $"of that class in memory, {survey.PlayerFlagged} flagged as the player's, "
+        + $"{survey.Candidates.Count} with a readable network role");
+
+    foreach (MacPlayerInventory.Candidate candidate in survey.Candidates)
+        Console.WriteLine($"  0x{candidate.Address:x}  role {candidate.Role} "
+            + $"({(candidate.Role == 3 ? "authoritative" : "replica")})  "
+            + $"{candidate.Items} item(s)"
+            + (candidate.Address == survey.Chosen ? "   <- chosen" : ""));
+
+    if (survey.Problem is { } problem) Console.WriteLine($"  {problem}");
+
+    if (survey.Chosen == 0) return 1;
+
+    // The cheap re-check every grant would do before using the cached address.
+    long again = inventory.Locate(layout);
+    Console.WriteLine(again == survey.Chosen
+        ? "  re-checked: the chosen object still looks like the player's inventory."
+        : $"  re-checked: it no longer does; a fresh sweep chose 0x{again:x}.");
     return 0;
 }
 

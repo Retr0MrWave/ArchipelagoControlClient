@@ -105,6 +105,21 @@ bool ok(const std::string& json) {
     return field(json, "ok", text) && text == "true";
 }
 
+/// Read eight bytes through the shim: a json reply saying how much is coming, then that many bytes
+/// in a binary frame.
+bool read_u64(uint64_t id, uint64_t address, uint64_t& out) {
+    std::string response = request(std::to_string(id) + " read " + std::to_string(address) + " 8");
+    uint64_t length = 0;
+    if (!ok(response) || !field_u64(response, "len", length) || length != 8) return false;
+
+    uint8_t kind = 0;
+    std::vector<uint8_t> body;
+    if (!recv_frame(kind, body) || kind != kBinary || body.size() != 8) return false;
+
+    std::memcpy(&out, body.data(), sizeof out);
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -213,6 +228,48 @@ int main(int argc, char** argv) {
                  ", expected 1023");
         else
             pass("call delivers x0-x7 and d0-d1 correctly, on the game's own thread");
+    }
+
+    // --- vtable: the RTTI walk ----------------------------------------------------------------
+    //
+    // Checked against a live instance rather than against an address computed here, because the
+    // instance's first word IS the answer: whatever the compiler emitted and dyld rebased, that
+    // word points at the primary vtable's address point. A walk that lands two words early - the
+    // classic way to read the Itanium layout wrong - disagrees with it immediately.
+    uint64_t instance = 0;
+    if (!field_u64(request("9 sym ap_test_vtable_instance"), "addr", instance) || instance == 0) {
+        fail("sym could not resolve the RTTI probe instance");
+    } else {
+        uint64_t installed = 0;
+        std::string response = request("10 vtable 17ApTestVtableProbe");
+        uint64_t walked = 0;
+        uint64_t type_info = 0;
+
+        if (!read_u64(11, instance, installed) || installed == 0)
+            fail("could not read the probe instance's vtable pointer");
+        else if (!ok(response))
+            fail("vtable failed: " + response);
+        else if (!field_u64(response, "typeinfo", type_info) || type_info == 0)
+            fail("vtable found no type_info");
+        else if (!field_u64(response, "addr", walked) || walked == 0)
+            fail("vtable returned no candidates");
+        else if (walked != installed)
+            fail("vtable found 0x" + std::to_string(walked) + " but instances carry 0x" +
+                 std::to_string(installed));
+        else
+            pass("vtable walks RTTI to the vtable an instance actually points at");
+
+        // "tableProbe" really is in the binary, NUL-terminated, as the tail of the probe's own
+        // RTTI name. Nothing about the bytes around it says so; what rules it out is that no
+        // type_info points at it. This is the check that keeps a heap scan from hunting the wrong
+        // class - so the error has to say the name WAS found, or the test proves nothing.
+        std::string tail = request("12 vtable tableProbe");
+        if (ok(tail))
+            fail("vtable matched the tail of a longer name");
+        else if (tail.find("occurrence") == std::string::npos)
+            fail("vtable rejected 'tableProbe' without finding it: " + tail);
+        else
+            pass("vtable finds a name no type_info points at, and rejects it");
     }
 
     close(g_fd);

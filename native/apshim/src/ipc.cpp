@@ -20,6 +20,7 @@
 #include "log.h"
 #include "mainthread.h"
 #include "memory.h"
+#include "rtti.h"
 #include "symbols.h"
 
 namespace ap::ipc {
@@ -210,6 +211,34 @@ std::string op_regions(uint64_t id, bool candidates_only) {
     return json::Object().num("id", id).flag("ok", true).raw("regions", list).str();
 }
 
+/// vtable <rtti-name> [image]
+///
+/// The name-resolved stand-in for a per-build vtable address. The client scans the heap for one of
+/// these to find a game object of a given class, which on Windows means carrying the vtable's RVA
+/// in a table keyed on the executable's hash; here the binary is asked instead.
+std::string op_vtable(uint64_t id, const std::vector<std::string>& args) {
+    if (args.size() < 3) return fail(id, "usage: vtable <rtti-name> [image]");
+
+    rtti::Result found = rtti::find(args[2], args.size() > 3 ? args[3] : std::string());
+    if (!found.found) return fail(id, found.error);
+
+    std::string list = "[";
+    for (const rtti::Vtable& vtable : found.vtables) {
+        if (list.size() > 1) list += ',';
+        list += json::Object().num("addr", vtable.address).inum("top", vtable.offset_to_top).str();
+    }
+    list += ']';
+
+    return json::Object()
+        .num("id", id)
+        .flag("ok", true)
+        .text("image", found.image)
+        .num("name", found.name_string)
+        .num("typeinfo", found.type_info)
+        .raw("vtables", list)
+        .str();
+}
+
 std::string op_scan(uint64_t id, const std::vector<std::string>& args) {
     if (args.size() < 3) return fail(id, "usage: scan <hex-pattern> <align> <lookahead> [limit]");
 
@@ -354,6 +383,8 @@ bool handle(int fd, const std::string& line) {
             send_json(
                 json::Object().num("id", id).flag("ok", true).num("addr", symbols::resolve(args[2])).str());
         }
+    } else if (op == "vtable") {
+        send_json(op_vtable(id, args));
     } else if (op == "regions") {
         send_json(op_regions(id, args.size() < 3 || args[2] != "all"));
     } else if (op == "read") {

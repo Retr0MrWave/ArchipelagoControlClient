@@ -25,7 +25,7 @@ namespace Ap.Control.Memory.Mac
             _ownsShim = shim is null;
         }
 
-        public bool IsReady => Shim.IsConnected && Profile() is { IsComplete: true };
+        public virtual bool IsReady => Shim.IsConnected && Profile() is { IsComplete: true };
 
         /// <summary>The profile for the running build, re-resolved while the game is not attached.</summary>
         protected MacGameBuildProfile? Profile()
@@ -74,24 +74,36 @@ namespace Ap.Control.Memory.Mac
     /// <summary>
     /// Spawns inventory items into the running game on macOS.
     ///
-    /// STILL TO DO, and deliberately not guessed at: two things are needed before this can work on
-    /// a given build.
+    /// The object half of this is done: <see cref="MacPlayerInventory"/> finds the player's
+    /// inventory by walking the binary's RTTI for the class's vtable and sweeping the heap for it,
+    /// with no per-build address involved.
     ///
-    ///   1. <c>MacGameBuildProfile.GiveItemFromDefinition</c>, the equivalent of the Windows
-    ///      FUN_1403b6c30. Find it from the GameInventoryComponentState vtable, which is locatable
-    ///      at runtime from the RTTI name string "27GameInventoryComponentState" that the stripped
-    ///      Game binary still carries; the wanted method is the one taking a GID and a float that
-    ///      reaches DynamicEntitySpawner.
-    ///   2. The player's inventory object, found the way the Windows granter finds it: scan for the
-    ///      vtable, keep the candidates whose player flag is set, and prefer the replica whose
-    ///      network role is authoritative.
-    ///
-    /// The call itself is then a single main-thread request — this(x0), fire flag(x1), GID pointer
-    /// (x2), amount(d0) — which the shim already supports and has a test for.
+    /// STILL TO DO, and deliberately not guessed at: <c>MacGameBuildProfile.GiveItemFromDefinition</c>,
+    /// the equivalent of the Windows FUN_1403b6c30. It is a method on the class whose vtable the
+    /// scan already resolves — the one taking a GID and a float that reaches DynamicEntitySpawner.
+    /// Once it is filled in, the grant is one main-thread request: this(x0), fire flag(x1), GID
+    /// pointer(x2), amount(d0), which the shim already supports and has a test for. The GID needs
+    /// somewhere in the game's address space to live for the duration of the call, which is the
+    /// one piece of protocol the shim still lacks.
     /// </summary>
     internal sealed class MacItemGranter : MacGranterBase, IItemGranter
     {
-        internal MacItemGranter(ShimClient? shim = null) : base(shim) { }
+        private readonly MacPlayerInventory _inventory;
+
+        internal MacItemGranter(ShimClient? shim = null) : base(shim)
+            => _inventory = new MacPlayerInventory(Shim);
+
+        /// <summary>The inventory locator, for the <c>probe-game</c> diagnostic.</summary>
+        internal MacPlayerInventory Inventory => _inventory;
+
+        /// <summary>Which fields the scan reads, per the running build.</summary>
+        internal InventoryLayout Layout => Profile()?.Inventory ?? InventoryLayout.Default;
+
+        /// <summary>
+        /// Mirrors the Windows granter: ready means a player inventory was found, not that one
+        /// could be. Locating sweeps the heap, which is not something a status property should do.
+        /// </summary>
+        public override bool IsReady => base.IsReady && _inventory.LastFound != 0;
 
         public Task StartAsync(CancellationToken cancellationToken = default)
         {
@@ -102,10 +114,13 @@ namespace Ap.Control.Memory.Mac
         public Task<GrantResult> GiveItemAsync(ulong gid, float parameter = 1.0f,
             CancellationToken cancellationToken = default)
         {
-            string reason = WhyNot(p => p.GiveItemFromDefinition, "inventory items")
-                ?? "the player's inventory object has not been located on macOS yet "
-                 + "(see MacItemGranter's notes).";
-            return Task.FromResult(GrantResult.Fail(reason));
+            if (WhyNot(p => p.GiveItemFromDefinition, "inventory items") is { } reason)
+                return Task.FromResult(GrantResult.Fail(reason));
+
+            return Task.FromResult(_inventory.Locate(Layout) == 0
+                ? GrantResult.Fail("the player's inventory is not in memory — is a save loaded?")
+                : GrantResult.Fail("the give-item function is mapped but the shim has nowhere to "
+                                 + "put the item definition for the call."));
         }
     }
 

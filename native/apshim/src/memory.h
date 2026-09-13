@@ -29,6 +29,13 @@ size_t read(uint64_t addr, void* out, size_t len);
 /// Write, refusing anything that is not in a writable mapping. Returns bytes written.
 size_t write(uint64_t addr, const void* data, size_t len);
 
+/// Whether an address lies in mapped, executable memory - i.e. whether it could be a function.
+///
+/// This is the check that makes the RTTI walk safe. Distinguishing a vtable from the other
+/// structures that point at the same type_info comes down to what follows the type_info, and
+/// "is it code" is a question the kernel can answer exactly, where any pattern rule would guess.
+bool is_executable(uint64_t addr);
+
 /// Find every <paramref>align</paramref>-aligned occurrence of a byte pattern in the candidate
 /// regions. <paramref>lookahead</paramref> is how far past a match the caller intends to inspect;
 /// windows overlap by that much so a match never falls between two reads.

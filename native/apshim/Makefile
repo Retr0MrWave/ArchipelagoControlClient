@@ -55,8 +55,12 @@ CHECKCLI := $(OUT)/checkclient
 $(FAKECORE): test/fakecore.cpp | $(OUT)
 	$(CXX) $(COMMON) -O0 -g -dynamiclib -install_name @rpath/libfakecore.dylib -o $@ $<
 
+# -export_dynamic so the RTTI probe instance is reachable through dlsym, the way the game's own
+# exported symbols are. Without it the executable's symbols are visible to the linker but not at
+# runtime, and the test would fail for a reason that has nothing to do with the shim.
 $(FAKEGAME): test/fakegame.cpp $(FAKECORE)
-	$(CXX) $(COMMON) -O0 -g -o $@ $< -L$(OUT) -lfakecore -Wl,-rpath,@executable_path
+	$(CXX) $(COMMON) -O0 -g -o $@ $< -L$(OUT) -lfakecore -Wl,-rpath,@executable_path \
+	    -Wl,-export_dynamic
 
 $(CHECKCLI): test/checkclient.cpp | $(OUT)
 	$(CXX) $(COMMON) -O0 -g -o $@ $<

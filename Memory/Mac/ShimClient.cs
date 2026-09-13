@@ -24,6 +24,40 @@ namespace Ap.Control.Memory.Mac
     public readonly record struct ShimKeyHit(uint Value, long Address, byte[] Window);
 
     /// <summary>
+    /// One of a class's vtables, found by walking the game's RTTI.
+    /// </summary>
+    /// <param name="Address">
+    /// The address point — what an instance's first word holds, which is what a heap scan looks for.
+    /// </param>
+    /// <param name="OffsetToTop">
+    /// Displacement to the start of the complete object: 0 on the primary vtable, negative on the
+    /// secondaries a class with several bases also carries.
+    /// </param>
+    public readonly record struct ShimVtable(ulong Address, long OffsetToTop)
+    {
+        public bool IsPrimary => OffsetToTop == 0;
+    }
+
+    /// <summary>
+    /// The result of an RTTI lookup. Carries the reason on failure rather than an empty list,
+    /// because "this build renamed the class" and "the game is not running" want different answers
+    /// from whoever asked.
+    /// </summary>
+    public readonly record struct ShimVtableLookup(ShimVtable[] Vtables, string? Error)
+    {
+        /// <summary>The vtable an instance's first word points at, if the class has one.</summary>
+        public ShimVtable? Primary
+        {
+            get
+            {
+                foreach (ShimVtable vtable in Vtables)
+                    if (vtable.IsPrimary) return vtable;
+                return null;
+            }
+        }
+    }
+
+    /// <summary>
     /// Talks to <c>libapcontrol.dylib</c> inside the running game.
     ///
     /// The shim is the server, so this client's connection state IS the answer to "is the game
@@ -222,6 +256,37 @@ namespace Ap.Control.Memory.Mac
         {
             if (Request($"sym {mangled}") is not { } response) return 0;
             using (response) return response.RootElement.GetProperty("addr").GetUInt64();
+        }
+
+        /// <summary>
+        /// Find a class's vtables from its RTTI name, as the binary spells it —
+        /// <c>"27GameInventoryComponentState"</c>, length-prefixed and without the <c>_ZTS</c>.
+        ///
+        /// This is what stands in for the Windows profile's vtable RVAs. Those have to be
+        /// re-derived by hand for every game build; this is resolved from the running binary, so a
+        /// game update does not touch it. The primary vtable comes first.
+        /// </summary>
+        /// <param name="image">Which loaded image to search; the main executable by default.</param>
+        internal ShimVtableLookup Vtables(string rttiName, string? image = null)
+        {
+            if (Request($"vtable {rttiName}{(image is null ? "" : $" {image}")}") is not { } response)
+                return new ShimVtableLookup([], "the shim is not reachable");
+
+            using (response)
+            {
+                JsonElement root = response.RootElement;
+                if (!root.GetProperty("ok").GetBoolean())
+                    return new ShimVtableLookup([],
+                        root.TryGetProperty("error", out JsonElement why)
+                            ? why.GetString() ?? "the lookup failed"
+                            : "the lookup failed");
+
+                var found = new List<ShimVtable>();
+                foreach (JsonElement vtable in root.GetProperty("vtables").EnumerateArray())
+                    found.Add(new ShimVtable(vtable.GetProperty("addr").GetUInt64(),
+                                             vtable.GetProperty("top").GetInt64()));
+                return new ShimVtableLookup([.. found], null);
+            }
         }
 
         /// <summary>

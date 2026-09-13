@@ -32,7 +32,7 @@ the wrong fit for macOS. Everything below was verified on the Steam build instal
   thread" — which is the closest thing to a supported API this engine has.
 
 ## 0.5 Status
-Phases 0, 1 and most of 2 are built and on the `macos-port` branch. What runs today:
+Phases 0, 1 and 2 are built and on the `macos-port` branch. What runs today:
 - **Patcher** works against the real install. All four patches resolve their targets and dry-run
   length-neutrally with every balancer and record-boundary validator satisfied.
 - **Shim** loads, interposes the pump and `saveGame`, and serves the socket. `make -C native/apshim
@@ -40,10 +40,14 @@ Phases 0, 1 and most of 2 are built and on the `macos-port` branch. What runs to
   runs in CI on a machine with no copy of the game.
 - **Client** selects the macOS backends, identifies the build by LC_UUID, and reconciles GameFlow
   state (clearance, sector flags) through the shim.
+- **Object discovery** needs no per-build address: the `vtable` op walks the binary's RTTI, and
+  `MacPlayerInventory` sweeps the heap for the player's inventory and picks the authoritative
+  replica. `Ap.Control probe-game` prints each step of that, which is how it is confirmed against a
+  live game.
 - **Not yet**: inventory items and ability upgrades, which need §4.3's reverse engineering. The
   profile holds zeroes rather than guesses and the granters say which feature is unmapped.
 
-Three things came out differently from the design below, all deliberate:
+Four things came out differently from the design below, all deliberate:
 1. **Requests are whitespace-separated tokens, not JSON** (responses are still JSON). Every argument
    is a number, a hex blob or a mangled name, so the shim needs no JSON parser inside the game's
    address space; the client keeps a real one for the structured half.
@@ -54,6 +58,12 @@ Three things came out differently from the design below, all deliberate:
 3. **No `pump_state` event.** The `pump` op answers the same question when the client actually wants
    to know, and the client is already polling on its reconcile tick. An event nobody subscribes to
    between polls is machinery for its own sake.
+4. **The RTTI walk finds the name string by section flags and disambiguates by `type_info`**, rather
+   than looking in `__TEXT,__cstring` for a string that starts at a NUL boundary. Both halves of that
+   assumption are wrong on this build; §4.2 has the detail. The walk as built would have found these
+   classes under either assumption, but it also finds `15UIAbilitiesMenu`, which the original rule
+   would have silently missed — and silently is the problem, since the result is a heap scan for a
+   vtable address of zero.
 
 One bug surfaced while running it: `SaveFileWatcher` threw on a missing directory. Harmless on
 Windows, where the memory source is the default, but fatal on macOS where the file source is and a
@@ -71,7 +81,7 @@ player who has never saved has no such directory. It now waits for the directory
 | Symbols | `coregame.dylib`: 54,433 exported defined symbols (127k incl. local); `coreshared.dylib` 11,817; `rl.dylib` has `r::FlowConnectionManager::*`, `r::makeStringCRC32`; `Game`: 285 exports, local symbols stripped, but 3,592 **named imports** | `nm -gU`, `nm -u` |
 | Pump | `coregame::DynamicEntitySpawner::update()` is exported (`_ZN8coregame20DynamicEntitySpawner6updateEv`, coregame+0x143c78), is **imported by `Game`**, and has **zero internal callers inside coregame.dylib** → every call goes through the dynamic linker → **dyld interposing works** with no code patching | `nm -u Game`, `otool -tvV coregame.dylib` |
 | Other dlsym-able anchors | `coregame::GameHelper::saveGame(net::NetworkRole,bool,bool)` (`_ZN8coregame10GameHelper8saveGameEN3net11NetworkRoleEbb`), `coregame::GameObjectManager::getInstance()` / `sm_instances`, `r::FlowConnectionManager::sm_pInstance` (`_ZN1r21FlowConnectionManager12sm_pInstanceE`), `r::makeStringCRC32(char const*, unsigned)`, `d::BaseTweakable::setTweakable(char const*, char const*, bool)`, `coregame::ScriptEventHandler::postGameEvent/postScriptMessage(GameObjectState*, char const*)` | `nm` |
-| RTTI | `Game` `__cstring` contains the Itanium typeinfo names `27GameInventoryComponentState`, `30PlayerPropertiesComponentState`, `5UIHud`, `15UIAbilitiesMenu`, `31AbilityUpgradeModComponentState` → vtables locatable at runtime | `strings` |
+| RTTI | `Game` **`__TEXT,__const`** (not `__cstring`, as v2 of this plan assumed) contains the Itanium typeinfo names `27GameInventoryComponentState`, `30PlayerPropertiesComponentState`, `5UIHud`, `15UIAbilitiesMenu`, `31AbilityUpgradeModComponentState`. Each is named by exactly one `type_info` in `__DATA_CONST,__const`, which is in turn named by one vtable — two for `5UIHud`, which has a secondary at `offset_to_top -8`. → vtables locatable at runtime | `strings`, chained-fixup decode of `__DATA_CONST` |
 | Script/RPC name tables | `Game` contains the script-facing method name tables of its internal client/server message managers, e.g. `SaveGame`, `UnlockSecondaryWeaponSlot`, `UnlockCharacterModSlot`, `AddAbilityPoints`, `RemoveAllAbilityUpgrades`, `SetGlobalBoolVariable/IntVariable/FloatVariable`, `GetGlobalBoolVariable…`, `UnlockControlPoint`, `DropLootItem`, `AddMission`, `CompleteStep`, followed by `Error executing RPC, target: ServerGameMessageManager` / `ClientGameMessageManager`. Dispatch machinery: `net::RPCDispatcher::onRPCReceived(int, short, r::BufferedMemoryStream&)` (exported from `network.dylib`) | `strings`, `nm` |
 | Dev tooling left in | A native debug page (`DebugPanel::DebugPage`) with buttons "Give all ability unlocks", "Give all ability unlocks + upgrades", "Give sec. weapoon slot", "Remove all ability unlocks + upgrades", "Award Ability Points", "Award Essence", "Unlocked Control Points (click to jump)"; a `DevCommandServer` RPC target with `executeServerDebugEvent`, `executeScriptEventByIndex/ByOffset`, `debugTeleport`, `episodeControllerSetTaskComplete`… Also two `*-development-000` packfiles (323 MB + 634 MB) are shipped. | `strings` |
 | Coherent UI | Shipped views: `menu.ui persistent.ui hud.ui index.ui intro.ui loadingscreen.ui photo.ui splash.ui system.ui expedition-*.ui`. C++→JS handlers are UI-shaped (`OnShopUpgradeRequested`, `OnItemCrafted`, `OnControlPointClicked`, …) — all economy/flow gated. The debug page is **not** a Coherent view. | pack index, `strings` |
@@ -151,7 +161,7 @@ Components:
 |---|---|---|
 | `hello` | → `{pid, main_thread_id, images:[{name, base, slide, uuid}]}` | `Game`'s UUID keys the build profile (§4.1) |
 | `dlsym` | `{sym}` → `{addr}` | `dlsym(RTLD_DEFAULT, sym)`; `sym` without the leading underscore |
-| `vtable` | `{rtti_name}` → `{candidates:[{addr, offset_to_top}]}` | §4.2 |
+| `vtable` | `<rtti-name> [image]` → `{image, name, typeinfo, vtables:[{addr, top}]}` | §4.2. `addr` is the address point — what an instance's first word holds — so a heap scan can use it directly. Primary (`top` 0) first. |
 | `regions` | `{writable:true}` → `[{base, size, prot, share_mode}]` | `mach_vm_region_recurse` on `mach_task_self()` — unprivileged |
 | `read` | `{addr, len}` → raw bytes (short read allowed) | `mach_vm_read_overwrite` on self: returns an error instead of faulting on unmapped pages |
 | `write` | `{addr}` + raw body → `{written}` | same guard; only writable regions |
@@ -219,16 +229,25 @@ error messages the way `DescribeUnknown` does today. Current build: UUID
 | `FireApplyPin`, `FirePin` | ability grant / milestone | **RE** (§4.3-B) or superseded by semantic methods; per-build `Game` offsets |
 | `MilestoneThresholds` ×3 | milestone grant | **superseded** by `UnlockSecondaryWeaponSlot` / `UnlockCharacterModSlot` methods (§4.3-C) if they behave; else RE via the `UIAbilitiesMenu::UIAbilityMilestone` binder (exported) |
 
-RTTI vtable walk (done at runtime in the shim, Itanium ABI):
-1. In the `Game` image, find the C string `"27GameInventoryComponentState"` in `__TEXT,__cstring`
-   (`getsectiondata` + `memmem`).
-2. Find the `std::type_info` object: a pointer-sized word in `__DATA_CONST,__const` / `__DATA,__data`
-   whose *second* word points at that string (first word is the `__class_type_info` vtable).
-3. Find every location in `__DATA_CONST` / `__DATA` holding the typeinfo address whose *next* word is
-   a code pointer into `__TEXT` — each is `vtable[-1]`; the vtable's address point is `+8`. The
-   preceding word is `offset_to_top`; the primary vtable has `0`. Return all candidates (multiple
-   inheritance yields secondaries) with their offsets; the heap scan uses the primary.
-4. Read pointers from memory, not from the file: `__DATA_CONST` uses chained fixups on disk but is
+RTTI vtable walk (done at runtime in the shim, Itanium ABI) — implemented in `native/apshim/src/rtti.cpp`:
+1. In the `Game` image, find **every** NUL-terminated occurrence of `"27GameInventoryComponentState"`.
+   Search by section *flags*, not by name: the sections worth searching are the ones in `__TEXT`
+   without `S_ATTR_PURE_INSTRUCTIONS`, which is how the walk survives these names living in
+   `__TEXT,__const` rather than in `__cstring` where this plan first put them.
+2. Do not try to pick the right occurrence from the bytes around it — neither rule works. A name can
+   be the NUL-terminated tail of a longer mangled one (`P5UIHud\0`), so a match is not proof; and
+   requiring the name to *start* a string is wrong too, because `__TEXT,__const` is mixed constant
+   data where `15UIAbilitiesMenu` is preceded by `0xc0`. Let step 3 choose instead.
+3. Find the `std::type_info`: a pointer-sized word in a `__DATA*` section whose *second* word points
+   at one of those occurrences (first word is the `__class_type_info` vtable, a bind). Exactly one
+   occurrence has this, which is what makes it the disambiguator.
+4. Find every location in `__DATA*` holding the typeinfo address whose *next* word is a code pointer
+   — each is `vtable[-1]`; the vtable's address point is `+8`. The preceding word is `offset_to_top`;
+   the primary vtable has `0`. Return all candidates (multiple inheritance yields secondaries) with
+   their offsets; the heap scan uses the primary. "Is it code" is answered by the region's
+   protection bits, which is also what rules out a derived class's `__si_class_type_info` — that
+   names our typeinfo in the same way a vtable does, and is told apart by what follows it.
+5. Read pointers from memory, not from the file: `__DATA_CONST` uses chained fixups on disk but is
    rebased in memory.
 
 ### 4.3 Reverse-engineering targets and recipes (Ghidra or Binary Ninja on `Game`)
@@ -292,16 +311,22 @@ entities. Put the confirmed values in the macOS profile record, not in constants
 ```
 MacGameBuildProfile {
   Name = "Steam macOS 1.34 (build 21225456)",
-  GameUuid = "CF65DC88-F5CE-38A4-8A2A-21FD5F43F14B",
+  Uuid = "CF65DC88-F5CE-38A4-8A2A-21FD5F43F14B",
   // Game image offsets (slide added at runtime from `hello`)
-  GiveItemFromDefinition, AbilityApplyUpgrade, UnlockSecondaryWeaponSlot, UnlockCharacterModSlot,
-  SetGlobalBoolVariable,      // 0 = not mapped → fall back to CRC scan
-  // struct layout (confirmed on this build)
-  InvOffIsPlayer, InvOffNetRole, InvOffItemCount, MgrOff*, GomTable, EntInstanceGid, EntArchetypeGid
+  GiveItemFromDefinition, ApplyAbilityUpgrade, UnlockSecondaryWeaponSlot, UnlockCharacterModSlot,
+  // struct layout, defaulted from the Windows build and checked before use
+  Inventory = InventoryLayout { IsPlayer, NetRole, ItemCount },
+  // still to add with §4.3-B/D: MgrOff*, GomTable, EntInstanceGid, EntArchetypeGid
 }
 ```
 Everything symbol- or RTTI-derived is *not* in the record; it is resolved at runtime and therefore
 survives game updates. `MissingAddresses()` semantics stay as today.
+
+`InventoryLayout` is in the record but defaulted rather than per-build, because the checks in §4.4
+turned out to be worth more than a table: a candidate has to carry a plausible network role before
+the scan believes it, so a build that moved the field produces no candidates and says so, instead of
+reading a byte from the middle of some other member. Declaring it per-build is what makes correcting
+it a data change if that ever happens.
 
 ## 5. Loading the dylib
 
@@ -462,14 +487,14 @@ Goal: keep this memory-free.
 - Done when: the patched game boots, the Archipelago page shows in the main and pause menus, the
   elevator gate follows `window.APEV`, `restore` returns the bundle to stock byte-for-byte.
 
-**Phase 2 — Raw shim + C# backend — mostly DONE (RTTI vtable op and the inventory scan remain)**
+**Phase 2 — Raw shim + C# backend — DONE**
 - Implement the IPC ops of §3.1 (no semantic ops yet), `ShimClient`, `ShimGameMemory`.
 - Port `NativeGameFlowController` to `MacGameFlowController` using `scan/read/write` (CRC path,
   macOS pointer range). Done when clearance and sector flags reconcile in a live game.
 - Port `SaveMemoryWatcher` behind `ShimGameMemory` as the fallback, and do §7 steps 1–3 for the
   file path. Done when location checks flow to the AP server from a fresh save.
 - RTTI `vtable` op + inventory candidate scan; confirm §4.4 offsets. Done when the player inventory
-  object is found and re-found after a save load.
+  object is found and re-found after a save load — which is what `Ap.Control probe-game` prints.
 
 **Phase 3 — Grants (RE-bound; 3–6 days)**
 - Map §4.3 A–D in Ghidra; fill `MacGameBuildProfile`; add semantic ops; implement
@@ -515,4 +540,5 @@ nm -u  "$GAME/Contents/MacOS/Game" | c++filt | grep DynamicEntitySpawner   # pro
 strings -n 6 "$GAME/Contents/MacOS/Game" | grep -n 'UnlockSecondaryWeaponSlot\|SetGlobalBoolVariable\|Give all ability'
 vmmap <pid> | grep libapcontrol                       # is the shim loaded?
 tail -f ~/Library/Logs/Ap.Control/shim.log
+Ap.Control probe-game                                 # build, pump, RTTI walk, inventory scan
 ```
