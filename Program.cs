@@ -6,6 +6,9 @@ using Ap.Control.Utils.Interfaces;
 using Ap.Control.Memory;
 using Ap.Control.Memory.Mac;
 using Ap.Control.SaveFile;
+using Ap.Control.Utils.Save;
+
+if (args.Length > 0 && args[0] == "dump-save") return DumpSave(args);
 
 return await RunClientAsync(args);
 
@@ -26,9 +29,12 @@ static async Task<int> RunClientAsync(string[] args)
         Console.WriteLine(
             "Usage: Ap.Control [--server <url> --username <name> [--password <pass>]]\n" +
             "                  [--source memory|file] [--save <path>] [--items <apitems.json>]\n" +
-            "                  [--ui-port <n>] [--no-ui]\n\n" +
+            "                  [--ui-port <n>] [--no-ui]\n" +
+            "       Ap.Control dump-save [<path>]\n\n" +
             "With --server and --username the client connects on startup as before. Without them it\n" +
-            "waits for the in-game Archipelago page to supply the details.");
+            "waits for the in-game Archipelago page to supply the details.\n\n" +
+            "dump-save parses a save and prints the location checks it would report, without\n" +
+            "connecting to anything. With no path it looks where the client would look.");
         return 0;
     }
 
@@ -184,6 +190,70 @@ static async Task<int> RunClientAsync(string[] args)
     {
         if (bridge is not null) await bridge.DisposeAsync();
     }
+}
+
+/// <summary>
+/// Parse a save and print the location checks it would report, connecting to nothing.
+///
+/// The checks a player sees come from diffing consecutive saves, which makes "why did nothing
+/// happen?" hard to answer: it could be the file, the parse, the diff, or the server. This runs
+/// the first three against a save on disk and prints the result, so the rest is either confirmed
+/// or ruled out in one command. Diffing against null is exactly what the client does on startup,
+/// so this prints the same set the client would send at that moment.
+/// </summary>
+static int DumpSave(string[] args)
+{
+    string? path = args.Skip(1).FirstOrDefault(a => !a.StartsWith("--", StringComparison.Ordinal));
+    path ??= OperatingSystem.IsMacOS() ? MacSaveLocations.Preferred() : null;
+
+    if (path is null)
+    {
+        Console.Error.WriteLine("dump-save: no save path given and no default for this platform.");
+        return 1;
+    }
+    if (!File.Exists(path))
+    {
+        Console.Error.WriteLine($"dump-save: no save at {path}");
+        return 1;
+    }
+
+    ControlSave save;
+    try
+    {
+        save = new ControlSaveParser().ParseFile(path);
+    }
+    catch (Exception e)
+    {
+        Console.Error.WriteLine($"dump-save: {path} did not parse — {e.Message}");
+        return 1;
+    }
+
+    Console.WriteLine($"Save: {path} ({new FileInfo(path).Length:N0} bytes)");
+    Console.WriteLine($"Scope '{save.Header.FilenameStr}', {save.Chunks.Count} chunks: "
+        + string.Join(", ", save.Chunks.Select(c => c.UidHigh.ToString())));
+
+    SaveDiff diff = SaveDiffer.Diff(null, save);
+
+    void Report(string what, IReadOnlyList<ulong> gids)
+    {
+        Console.WriteLine($"\n{what}: {gids.Count}");
+        foreach (ulong gid in gids) Console.WriteLine($"  {gid}");
+    }
+
+    Report("Found locations", diff.NewFoundLocations);
+    Report("Sectors visited", diff.NewSectorsVisited);
+    Report("Control points", diff.NewUnlockedControlPoints);
+    Report("Collectibles", diff.NewCollectibles);
+
+    // Only state 2 is a completion, and only completions become checks.
+    ulong[] completed = [.. diff.MissionChanges.Where(m => m.NewState == 2).Select(m => m.GidMissionId)];
+    Report("Missions completed", completed);
+
+    int total = diff.NewFoundLocations.Count + diff.NewSectorsVisited.Count
+              + diff.NewUnlockedControlPoints.Count + diff.NewCollectibles.Count + completed.Length;
+    Console.WriteLine($"\n{total} check(s) would be sent. Whether the server accepts each one "
+        + "depends on the generated world having that location id.");
+    return 0;
 }
 
 /// <summary>
