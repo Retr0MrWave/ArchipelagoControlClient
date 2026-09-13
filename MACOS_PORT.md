@@ -259,9 +259,21 @@ intact (Ghidra's "RTTI Analyzer" / class recovery names the vtables for you).
 **A. Item grant — `GiveItemFromDefinition(this, char fire, GID* def, float amount)`**
 - Narrowed, not found. `coregame::DynamicEntitySpawner::spawnAt` has exactly **three** callers in
   `Game` — the functions starting `0x1003136a4`, `0x1004b4f70` and `0x1005829fc` (from
-  `tools/macho.py`: `callers_of` over `stubs_for('DynamicEntitySpawner7spawnAt')`). One of those, or
-  something they call, is the routine. Read them in the decompiler and look for the GID-and-float
-  signature.
+  `tools/macho.py`: `callers_of` over `stubs_for('DynamicEntitySpawner7spawnAt')`).
+- All three decompiled. None is obviously it, and two can probably be set aside: `0x1003136a4`
+  and `0x1005829e0` return void, where the Windows routine returns the spawned object.
+  `0x1004b4f70(long, char*, int)` does return a pointer, but its body is dense SIMD position
+  arithmetic, which reads as spawning into the world rather than adding to an inventory.
+- Dead ends recorded so they are not re-walked: `AddToInventoryComponentState`'s vtable
+  (`0x100dd4620`, 23 entries) holds only type-info accessors in its own slots, so the flow node
+  dispatches its apply through a function pointer in content data rather than a virtual. The
+  `m_in_funcAddItem` / `m_in_funcCanAddItem` strings are referenced once each, from reflection
+  registration (`0x100506864`, `0x1005067c0`), which gives the field's offset in the content struct
+  and not the function.
+- Next: the four code references to the `"GameInventoryComponentState"` cstring (`0x1004e4df0`,
+  `0x1004ee750`, `0x1004f0248`, …) land in the class's own code region, `0x1004e4000`–`0x1004f1000`.
+  That region, plus the 71 entries of its vtable, is the search space; look for the one taking a GID
+  and a float.
 - `DropLootItem` is a dead end for this: its handler at `0x10098782c` parses a GID, a string and
   three floats, i.e. it is the spawn-at-a-position path this section already rejected, not the
   inventory give.
