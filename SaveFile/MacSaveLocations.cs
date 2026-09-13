@@ -3,18 +3,29 @@ namespace Ap.Control.SaveFile
     /// <summary>
     /// Where Control keeps its save on macOS.
     ///
-    /// Written as a search rather than a constant because the exact location is not yet confirmed:
-    /// the machine this was developed on had never saved the game, and the binary's own strings
-    /// (<c>savegame-slot-%02d</c>, <c>persistent</c>, and platform.dylib's talk of savegame slot
-    /// sizes) suggest a slot container rather than the bare <c>persistent.chunk</c> the Windows
-    /// build writes. Searching the plausible roots for the newest save-shaped file costs a few
-    /// milliseconds once at startup and is right under either scheme.
+    /// Confirmed against a real playthrough: the macOS build writes a Steam Cloud slot container,
+    /// <c>Steam/userdata/&lt;id&gt;/870780/remote/savegame-slot-NN_persistent</c>, and not the bare
+    /// <c>persistent.chunk</c> the Windows build keeps in the bundle-identifier folder. The slot
+    /// splits a save across four files — <c>_global</c>, <c>_hub</c>, <c>_meta</c> and
+    /// <c>_persistent</c> — of which only <c>_persistent</c> carries the chunks this client reads.
+    /// The other three are written within seconds of it, so picking by timestamp alone is a
+    /// coin flip; the name and the header decide instead.
     ///
-    /// A player whose save lives somewhere unexpected can always pass --save.
+    /// Still written as a search rather than a constant: the Steam user id is per-account, the slot
+    /// number varies, and the Epic build has not been checked. A player whose save lives somewhere
+    /// unexpected can always pass --save.
     /// </summary>
     internal static class MacSaveLocations
     {
-        private static readonly string[] FilePatterns = ["persistent*", "savegame-slot-*"];
+        /// <summary>
+        /// Names that can hold the persistent chunk. Deliberately not a bare
+        /// <c>savegame-slot-*</c>: that also matches <c>_meta</c>, which is a 32-byte stub with a
+        /// different header, and <c>_hub</c> / <c>_global</c>, which are real saves of other scopes.
+        /// </summary>
+        private static readonly string[] FilePatterns = ["persistent*", "savegame-slot-*_persistent"];
+
+        /// <summary>The chunk-file header <see cref="Models.Header"/> insists on.</summary>
+        private static ReadOnlySpan<byte> Magic => [6, 0, 0, 0, 6, 0, 0, 0];
 
         /// <summary>Directories the save could be under, most likely first.</summary>
         internal static IEnumerable<string> Roots()
@@ -34,7 +45,7 @@ namespace Ap.Control.SaveFile
                     yield return Path.Combine(user, "870780", "remote");
         }
 
-        /// <summary>The newest save-shaped file under any root, or null if there is not one yet.</summary>
+        /// <summary>The newest real persistent chunk under any root, or null if there is not one yet.</summary>
         internal static string? Discover()
         {
             string? newest = null;
@@ -50,6 +61,7 @@ namespace Ap.Control.SaveFile
                     {
                         DateTime written = File.GetLastWriteTimeUtc(file);
                         if (written <= newestWrite) continue;
+                        if (!HasChunkHeader(file)) continue;
                         newest = file;
                         newestWrite = written;
                     }
@@ -59,13 +71,50 @@ namespace Ap.Control.SaveFile
         }
 
         /// <summary>
+        /// Whether a file opens with the chunk magic. The name narrows the field; this rejects the
+        /// rest, so a slot file that is renamed, truncated or half-written never becomes the thing
+        /// the watcher points at.
+        /// </summary>
+        private static bool HasChunkHeader(string path)
+        {
+            try
+            {
+                using FileStream fs = File.Open(path, FileMode.Open, FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete);
+                Span<byte> head = stackalloc byte[8];
+                return fs.ReadAtLeast(head, head.Length, throwOnEndOfStream: false) == head.Length
+                       && head.SequenceEqual(Magic);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
         /// The path to watch: the real save if there is one, otherwise the place one is most likely
         /// to appear. The watcher tolerates the second case and picks the file up when it shows up,
         /// which is what a player starting a brand-new game will do.
         /// </summary>
         internal static string Preferred()
             => Discover()
+               ?? ExpectedSlot()
                ?? Path.Combine(Roots().First(), "persistent.chunk");
+
+        /// <summary>
+        /// Where a first save will land for a player who has never made one: slot 00 of the Steam
+        /// Cloud folder, if this machine has one. Guessing this rather than the bundle-id folder is
+        /// what lets the watcher be waiting in the right directory before the game ever saves.
+        /// </summary>
+        private static string? ExpectedSlot()
+        {
+            foreach (string root in Roots())
+            {
+                if (root.EndsWith("remote", StringComparison.Ordinal) && Directory.Exists(root))
+                    return Path.Combine(root, "savegame-slot-00_persistent");
+            }
+            return null;
+        }
 
         private static string[] SafeDirectories(string path)
         {
