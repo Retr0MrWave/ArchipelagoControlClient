@@ -257,6 +257,16 @@ import, all `Coherent::UIGT::*Binder<UIAbilitiesMenu::UIAbility>` etc. are expor
 intact (Ghidra's "RTTI Analyzer" / class recovery names the vtables for you).
 
 **A. Item grant — `GiveItemFromDefinition(this, char fire, GID* def, float amount)`**
+- Narrowed, not found. `coregame::DynamicEntitySpawner::spawnAt` has exactly **three** callers in
+  `Game` — the functions starting `0x1003136a4`, `0x1004b4f70` and `0x1005829fc` (from
+  `tools/macho.py`: `callers_of` over `stubs_for('DynamicEntitySpawner7spawnAt')`). One of those, or
+  something they call, is the routine. Read them in the decompiler and look for the GID-and-float
+  signature.
+- `DropLootItem` is a dead end for this: its handler at `0x10098782c` parses a GID, a string and
+  three floats, i.e. it is the spawn-at-a-position path this section already rejected, not the
+  inventory give.
+- The inventory vtable has 71 entries (`walk_vtable`), which is the other place to look if the
+  routine turns out to be virtual after all.
 - Start from the inventory vtable (§4.2) → its `GameInventoryComponentState` methods; the
   give-from-definition routine is the one that takes a `GlobalIDPointer`/GID and a float and calls
   into the spawner (imports `coregame::DynamicEntitySpawner::spawnAt` / entity creation).
@@ -269,6 +279,14 @@ intact (Ghidra's "RTTI Analyzer" / class recovery names the vtables for you).
   the button callback iterates upgrades and calls a per-upgrade apply. That per-upgrade function is
   the point-free apply the Windows client reached through `AbilityTree_FireApplyPin`. Also record
   `"Remove all ability unlocks + upgrades"` (test/cleanup) and `"Award Ability Points"`.
+- Progress: the xref (`0x100afbe70`) is the page's **construction**, not its callback — it creates a
+  button and stores the handle at `page+0x190` (the neighbouring buttons land at `+0x188`, `+0x198`,
+  `+0x1a0`). The callback is whatever later reads `page+0x190`, which needs the decompiler's
+  data flow rather than a string xref.
+- Cheaper route to try first: `RemoveAllAbilityUpgrades` and `AddAbilityPoints` are in the same RPC
+  dispatch chain as the milestones in C, a few comparisons further along
+  (`AddAbilityPoints` compares at `0x100988010`). Reading those handlers out costs what C cost, and
+  remove-all has to reach the same per-upgrade machinery the apply does.
 - Equivalent: `RemoveAllAbilityUpgrades` sits in the server message manager's script table right
   next to `UnlockSecondaryWeaponSlot`; the *registration* of that table (a run of `(name, fn)` pairs
   or sequential register calls — xref `"UnlockSecondaryWeaponSlot"`) gives function pointers for
@@ -276,10 +294,26 @@ intact (Ghidra's "RTTI Analyzer" / class recovery names the vtables for you).
 - Fallback: port the Windows path 1:1 — `FlowConnMgr = *sm_pInstance` (dlsym), `pin = mgr+0xf8`,
   `AbilityTree_FireApplyPin` located by xref from the menu's ApplyUpgrade worker.
 
-**C. Milestones (weapon slot + 2 mod slots)**
-- `UnlockSecondaryWeaponSlot` and `UnlockCharacterModSlot` are script-facing methods. Resolve them
-  from the same table as B; call on the main thread with the manager instance as `this`. This
-  replaces the spent-points high-water-mark hack and the three threshold globals entirely.
+**C. Milestones (weapon slot + 2 mod slots) — FOUND**
+- There is no name-to-function table. The RPC dispatcher compares an incoming method name against
+  each name it knows and calls the handler inline, so the names are referenced from code, not data.
+  `tools/macho.py`'s `refs_to()` gives the comparison site directly:
+  `UnlockSecondaryWeaponSlot` → `0x100987f30`, `UnlockCharacterModSlot` → `0x100987f80`. The two are
+  0x50 apart in the same chain, as the plan guessed.
+- Reading each site out gives the handler and how it is called:
+
+  | method | handler | call |
+  |---|---|---|
+  | `UnlockSecondaryWeaponSlot` | `0x10087c51c` | `(this)` |
+  | `UnlockCharacterModSlot` | `0x10087c57c` | `(this, int slot)`, slot parsed from the params |
+
+  `this` is `*(*(0x100e68d60) + 0x20)` — the dispatcher's own route to the player-properties
+  object. `0x100e68d60` is in `__DATA,__common`, so it is filled in at runtime, not on disk.
+- Both read as the right functions: the first checks a tweakable against a counter at `this+0x44`
+  and returns early at the cap; the second clamps its argument to 0..3 and compares `this+0x48`
+  against two tweakables. The first also reads the network role at `this+0x10`, independently
+  confirming §4.4's measured offset on a different class. They sit 0x60 apart — adjacent methods.
+- **Not yet called.** The disassembly says what they are; an in-game grant says they work.
 - Verify persistence: the Windows path called `saveGame` afterwards; keep doing that.
 
 **D. GameFlow flags / clearance (`KEY1..KEY6`, sector `*_CanTravel_*` bools)**

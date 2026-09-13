@@ -83,11 +83,23 @@ namespace Ap.Control.Memory.Mac
         /// <summary>The point-cost-free ability-upgrade apply the debug page's "give all" uses.</summary>
         public long ApplyAbilityUpgrade { get; init; }
 
-        /// <summary>The script-facing UnlockSecondaryWeaponSlot.</summary>
+        /// <summary>
+        /// The script-facing UnlockSecondaryWeaponSlot, called as <c>(this)</c>.
+        /// </summary>
         public long UnlockSecondaryWeaponSlot { get; init; }
 
-        /// <summary>The script-facing UnlockCharacterModSlot.</summary>
+        /// <summary>
+        /// The script-facing UnlockCharacterModSlot, called as <c>(this, int slot)</c> where the
+        /// slot index is clamped to 0..3 by the callee.
+        /// </summary>
         public long UnlockCharacterModSlot { get; init; }
+
+        /// <summary>
+        /// Where the object those two are called on comes from: the game's own dispatcher reads
+        /// <c>*(*(Game + PlayerPropertiesHolder) + 0x20)</c>. Zero where it is not mapped, in which
+        /// case the object has to be found by scanning for its vtable instead.
+        /// </summary>
+        public long PlayerPropertiesHolder { get; init; }
 
         // --- struct layout ----------------------------------------------------------------------
 
@@ -138,8 +150,22 @@ namespace Ap.Control.Memory.Mac
 
             GiveItemFromDefinition = 0,
             ApplyAbilityUpgrade = 0,
-            UnlockSecondaryWeaponSlot = 0,
-            UnlockCharacterModSlot = 0,
+
+            // Read out of the game's own RPC dispatcher, which compares an incoming method name
+            // against each it knows and calls the handler inline. Identified statically and NOT yet
+            // called: the disassembly says what they are, an in-game grant says they work.
+            //
+            //   UnlockSecondaryWeaponSlot  checks a tweakable against a counter at this+0x44,
+            //                              returns early when already at the cap, and reads the
+            //                              network role at this+0x10 — the same offset the
+            //                              inventory scan measured, on a different class.
+            //   UnlockCharacterModSlot     clamps its argument to 0..3 and compares a counter at
+            //                              this+0x48 against two tweakables.
+            //
+            // They sit 0x60 apart, which is what adjacent methods on one class look like.
+            UnlockSecondaryWeaponSlot = 0x87c51c,
+            UnlockCharacterModSlot = 0x87c57c,
+            PlayerPropertiesHolder = 0xe68d60,
         };
 
         public static IReadOnlyList<MacGameBuildProfile> All { get; } = [Steam134];
