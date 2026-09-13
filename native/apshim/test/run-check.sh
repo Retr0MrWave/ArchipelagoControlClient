@@ -85,4 +85,18 @@ saves=$(echo "$output" | sed -n 's/.*saves=\([0-9]*\).*/\1/p')
 [ "$saves" = "1" ] || fail "the original saveGame did not run ($output)"
 echo "  ok   originals still ran ($output)"
 
+# --- a socket path that cannot fit -------------------------------------------------------------
+#
+# sun_path holds 104 bytes and bind silently accepts the truncation, so the shim used to announce
+# a socket it was not actually listening on - indistinguishable, from the client, from no game.
+
+LONG_LOG="$WORK/long.log"
+LONG_SOCK="$WORK/$(printf 'x%.0s' $(seq 1 120)).sock"
+AP_SHIM_LOG="$LONG_LOG" AP_SHIM_SOCKET="$LONG_SOCK" DYLD_INSERT_LIBRARIES="$SHIM" \
+	"$GAME" 100 >/dev/null 2>&1 || true
+
+grep -q 'could not listen' "$LONG_LOG" || fail "an over-long socket path was accepted silently"
+[ ! -S "$LONG_SOCK" ] || fail "an over-long socket path bound anyway"
+echo "  ok   an unusable socket path is reported, not truncated"
+
 echo "ok: shim loads, interposes, chains, and serves the full protocol"

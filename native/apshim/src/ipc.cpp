@@ -514,6 +514,15 @@ std::string choose_socket_path() {
 }
 
 int bind_socket(const std::string& path) {
+    // sockaddr_un.sun_path is 104 bytes and strncpy would quietly take the first 103. The shim
+    // would then bind, log that it is listening on the path it was given, and be unreachable at
+    // it - a failure that looks exactly like the game not running. choose_socket_path() already
+    // avoids this for the default; an AP_SHIM_SOCKET given by hand has to be checked too.
+    if (path.size() >= sizeof(sockaddr_un::sun_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
     size_t slash = path.rfind('/');
     if (slash != std::string::npos && slash > 0) {
         std::string dir = path.substr(0, slash);
