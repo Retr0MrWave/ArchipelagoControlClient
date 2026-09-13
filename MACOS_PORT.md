@@ -31,6 +31,34 @@ the wrong fit for macOS. Everything below was verified on the Steam build instal
   happened). Everything else becomes "call the game's own functions, in-process, on its own main
   thread" — which is the closest thing to a supported API this engine has.
 
+## 0.5 Status
+Phases 0, 1 and most of 2 are built and on the `macos-port` branch. What runs today:
+- **Patcher** works against the real install. All four patches resolve their targets and dry-run
+  length-neutrally with every balancer and record-boundary validator satisfied.
+- **Shim** loads, interposes the pump and `saveGame`, and serves the socket. `make -C native/apshim
+  check` proves it end to end against stand-in binaries that export the same mangled symbols, so it
+  runs in CI on a machine with no copy of the game.
+- **Client** selects the macOS backends, identifies the build by LC_UUID, and reconciles GameFlow
+  state (clearance, sector flags) through the shim.
+- **Not yet**: inventory items and ability upgrades, which need §4.3's reverse engineering. The
+  profile holds zeroes rather than guesses and the granters say which feature is unmapped.
+
+Three things came out differently from the design below, all deliberate:
+1. **Requests are whitespace-separated tokens, not JSON** (responses are still JSON). Every argument
+   is a number, a hex blob or a mangled name, so the shim needs no JSON parser inside the game's
+   address space; the client keeps a real one for the structured half.
+2. **A `keys` op replaces per-variable scanning.** GameFlow reconciliation asks about two dozen
+   variables a second. `keys` sweeps once for every name hash at a time and returns each hit with
+   the surrounding bytes, so classification needs no follow-up read. Without it the choice was two
+   dozen heap walks or hundreds of round trips, every second.
+3. **No `pump_state` event.** The `pump` op answers the same question when the client actually wants
+   to know, and the client is already polling on its reconcile tick. An event nobody subscribes to
+   between polls is machinery for its own sake.
+
+One bug surfaced while running it: `SaveFileWatcher` threw on a missing directory. Harmless on
+Windows, where the memory source is the default, but fatal on macOS where the file source is and a
+player who has never saved has no such directory. It now waits for the directory.
+
 ## 1. Verified facts
 
 | Subject | Finding | How verified |
@@ -422,19 +450,19 @@ Goal: keep this memory-free.
 
 ## 10. Phases and acceptance criteria
 
-**Phase 0 — Harness (½–1 day)**
+**Phase 0 — Harness — DONE**
 - Build a hello-world `libapcontrol.dylib` with the pump and `saveGame` interposers and a log file.
 - Launch via Terminal: `DYLD_INSERT_LIBRARIES=… SteamAppId=870780 SteamGameId=870780 "…/Game.app/Contents/MacOS/Game"`.
 - Done when: log shows the constructor ran in `Game`, pump ticks with a plausible rate during
   gameplay and (probably) not in menus, `saveGame` fires on a manual save, Steam overlay still works,
   and the same works through the wrapper set as a Steam launch option.
 
-**Phase 1 — Patcher on macOS (½ day)**
+**Phase 1 — Patcher on macOS — DONE except the in-game confirmation**
 - §6 changes; `dotnet publish -r osx-arm64`; `patcher status/apply/verify/restore --game <Game.app>`.
 - Done when: the patched game boots, the Archipelago page shows in the main and pause menus, the
   elevator gate follows `window.APEV`, `restore` returns the bundle to stock byte-for-byte.
 
-**Phase 2 — Raw shim + C# backend (2–3 days)**
+**Phase 2 — Raw shim + C# backend — mostly DONE (RTTI vtable op and the inventory scan remain)**
 - Implement the IPC ops of §3.1 (no semantic ops yet), `ShimClient`, `ShimGameMemory`.
 - Port `NativeGameFlowController` to `MacGameFlowController` using `scan/read/write` (CRC path,
   macOS pointer range). Done when clearance and sector flags reconcile in a live game.

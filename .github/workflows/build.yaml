@@ -46,3 +46,60 @@ jobs:
             "publish/patcher/Ap.Control.Patcher.exe#Ap.Control patcher (win-x64)" `
             --title "$env:GITHUB_REF_NAME" `
             --generate-notes
+
+  # Runs after the Windows job rather than beside it so that, on a tag, the release already exists
+  # and this only has to add to it.
+  build-macos:
+    runs-on: macos-latest
+    needs: build
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+          cache: true
+
+      # Builds the in-process shim and proves its interposers still fire. The runner has no copy of
+      # Control, which is exactly why the test uses stand-ins that export the same mangled symbols.
+      - name: Build and test the shim
+        run: make -C native/apshim check
+
+      - name: Restore client
+        run: dotnet restore Ap.Control.csproj --locked-mode
+      - name: Publish client
+        run: dotnet publish Ap.Control.csproj -c Release --no-restore -o publish/client
+
+      - name: Restore patcher
+        run: dotnet restore Ap.Control.Patcher/Ap.Control.Patcher.csproj --locked-mode
+      - name: Publish patcher
+        run: dotnet publish Ap.Control.Patcher/Ap.Control.Patcher.csproj -c Release --no-restore -o publish/patcher
+
+      # One archive, because the four pieces only work together - and because tar preserves the
+      # executable bit and adds no quarantine flag, which a zip downloaded by a browser would.
+      - name: Package
+        run: |
+          mkdir -p drop
+          cp publish/client/Ap.Control drop/
+          cp publish/patcher/Ap.Control.Patcher drop/
+          cp native/apshim/out/libapcontrol.dylib drop/
+          cp native/apshim/apcontrol-launch.sh drop/
+          chmod 755 drop/*
+          tar -czf Ap.Control-osx-arm64.tar.gz -C drop .
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ap-control-macos-${{ github.sha }}
+          path: Ap.Control-osx-arm64.tar.gz
+          if-no-files-found: error
+
+      - name: Add to the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            "Ap.Control-osx-arm64.tar.gz#Ap.Control client + patcher + shim (macOS, Apple silicon)" \
+            --clobber
