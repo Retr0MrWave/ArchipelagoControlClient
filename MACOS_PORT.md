@@ -1,5 +1,11 @@
 # macOS native port of Ap.Control — plan v2
 
+> **Continuing this work?** Start at **§0.6**, which has the toolchain, the commands, what is done,
+> and what the remaining work is in the order to take it. §0.5 is the status; the rest is the plan
+> and the record of what was learned against it. Where doing the work contradicted the plan, the
+> plan has been corrected in place and the correction marked, so a section can be trusted as it
+> reads.
+
 This replaces the v1 plan. v1 assumed the Windows model had to be re-created on macOS
 (`task_for_pid` + `mach_vm_*` from a foreign process, AArch64 shellcode, inline detours with
 thread suspension). Research against the local install shows that model is both unnecessary and
@@ -23,8 +29,12 @@ the wrong fit for macOS. Everything below was verified on the Steam build instal
   `GameObjectManager`, the `FlowConnectionManager` singleton and `makeStringCRC32` are all
   `dlsym`-able. The stripped main executable still carries RTTI name strings, so the two vtables we
   scan for are found at runtime by a typeinfo walk. Only a handful of game-specific functions
-  remain to be located by reverse engineering, and the binary hands us name→function tables
-  (script/RPC method names, a compiled-in developer debug page) that make that cheap.
+  remain to be located by reverse engineering, and the script/RPC method names and the compiled-in
+  developer debug page make that cheap.
+  *Correction from doing it:* there are **no** name→function tables. The RPC dispatcher compares an
+  incoming name against each one it knows and calls the handler inline, so the names are referenced
+  from code, not data — which is still cheap, but by a different route (§4.3-C). Searching the data
+  sections for them finds nothing, and that absence is not evidence the names are unused.
 - **"Communicate without modifying memory" — verdict:** not fully achievable for grants (§2 explains
   what was checked). What *is* memory-free stays memory-free: elevator gating (pure JS), the in-game
   UI, and location tracking (save file on disk, with the dylib only *announcing* that a save
@@ -71,6 +81,76 @@ Four things came out differently from the design below, all deliberate:
 One bug surfaced while running it: `SaveFileWatcher` threw on a missing directory. Harmless on
 Windows, where the memory source is the default, but fatal on macOS where the file source is and a
 player who has never saved has no such directory. It now waits for the directory.
+
+## 0.6 Picking this up
+
+Written for someone who has not been here before. Everything is current as of the head of
+`macos-port`.
+
+### Install
+
+| What | Why | Note |
+|---|---|---|
+| Xcode Command Line Tools | `clang++` builds the shim; `xcrun llvm-objdump` reads the game binary | |
+| .NET SDK 10 | client and patcher | |
+| Ghidra | decompiling the two functions still missing | `brew install ghidra`. It pulls `openjdk@21`, which Homebrew keeps keg-only, so **every** headless invocation needs `JAVA_HOME` set — see `tools/README.md` |
+| Control, Steam macOS 1.34 | every address in the profile is for this build only | `Game` LC_UUID `CF65DC88-F5CE-38A4-8A2A-21FD5F43F14B` |
+
+`tools/macho.py` needs Python 3 and no packages.
+
+### The loop
+
+```sh
+make -C native/apshim check     # shim, end to end, no game needed — run before and after touching it
+make -C native/apshim install   # quit Control first; renames into place
+dotnet build                    # client
+```
+
+Then launch Control from Steam with the launch option of §5.1 set, and:
+
+```sh
+./bin/Debug/net10.0/osx-arm64/Ap.Control probe-game
+```
+
+The shim serves several clients at once, so `probe-game` and a running client coexist. If a command
+hangs for 70 seconds and then reports nothing listening, that is the client's reply timeout: check
+`~/Library/Logs/Ap.Control/shim.log` for whether the dylib loaded at all.
+
+### The diagnostics, and when to reach for each
+
+| Command | Answers |
+|---|---|
+| `probe-game` | Is the shim up, which build, is the pump ticking, can the player's inventory be found — each step printed separately, so the one that broke is visible |
+| `probe-game --layout [<rtti-name>]` | Where does this build keep a class's fields? Compares every instance in memory. Finds anything with a *shape*: a flag set on one or two objects, a two-bit network role. Takes any class, so it serves §4.3-B as well as it served the inventory |
+| `probe-game --layout --snapshot <path>` | What changed in the player's object between two runs? For fields with no shape — a count is any small number. Snapshot, do the thing in game, run again. The noise floor is zero, so one observation is enough. `--window 0x800` if a diff comes back empty |
+| `try-unlock weapon-slot \| mod-slot <2\|3>` | Is an address really the function it looks like? Calls it in the live game. Refuses unless the object carries the right vtable and the pump is ticking. **Changes the player's game, and the milestone methods save themselves** |
+| `dump-save [<path>]` | What checks would this save report? No game, no server |
+
+### What is done, and what the remaining work is
+
+Phases 0–2 are complete (§10). Phase 3 has two of four addresses, both confirmed by calling them in
+a live game; progressive milestones grant for real. What is left:
+
+1. **`GiveItemFromDefinition`** (§4.3-A). Search space, dead ends and the three `spawnAt` callers are
+   all recorded there. This is the bigger of the two.
+2. **A place to put the GID** — the item grant passes a pointer to a definition, and the shim has no
+   way to hand the client memory inside the game. Roughly fifteen lines: an `alloc`/`free` op over
+   `malloc`, or a fixed static scratch buffer whose address `hello` reports. A static buffer is
+   enough because the client serialises requests and one call runs at a time. Left undone only
+   because it could not be tested without the address.
+3. **`ApplyAbilityUpgrade`** (§4.3-B). The cheaper route to try first is recorded there.
+4. **Item count** (§4.4) — optional, nothing reads it, and the disassembler will answer it in a
+   minute once someone is in there anyway.
+
+### Known-unknowns worth not rediscovering
+
+- Four bytes — `+0x45`, `+0x55`, `+0x60`, `+0x88` — are set on exactly the player's two inventory
+  replicas. Any locates the object; which one *means* "is the player" is unsettled (§4.4).
+- The Ghidra project lives wherever you put it and is not in the repo. Re-importing `Game` takes
+  about ten minutes and 250 MB; put it somewhere that survives the session.
+- Every address in the profile moves when the game updates. `tools/` exists so re-deriving them is
+  a repeatable procedure rather than a fresh investigation — §4.3 records how each was found, not
+  just what it is.
 
 ## 1. Verified facts
 
@@ -173,10 +253,22 @@ Components:
 | `event:save_game` | `{role}` | from the `saveGame` interposer, after the original returns |
 | `event:pump_state` | `{ticking:bool}` | emitted when the pump starts/stops ticking (menu vs gameplay), so the client can explain deferred grants |
 
-Semantic ops are added in Phase 3 as each function is mapped (`give_item`, `grant_ability`,
-`unlock_weapon_slot`, `unlock_mod_slot`, `set_global_bool`, `save_game`, `find_player_inventory`,
-`list_ability_upgrades`). Each is a thin wrapper over `call_main` with the resolved function, so
-the C# side can move from raw ops to semantic ops without protocol churn.
+Semantic ops were proposed for Phase 3 (`give_item`, `grant_ability`, `unlock_weapon_slot`, …) as
+thin wrappers over `call_main`. In practice none has been needed: the milestone grants are one
+`call` each with addresses the client already holds, and a wrapper per grant would move C# logic
+into the game's address space for no gain. Add one only where it buys something.
+
+**One op is genuinely missing**, and the item grant cannot be finished without it: the client has no
+way to put bytes somewhere inside the game and pass their address. `GiveItemFromDefinition` takes a
+pointer to a GID, and `write` needs a target that already exists. Two ways, both small:
+
+- `alloc <len>` → `{addr}` plus `free <addr>`, over `malloc`. General, and needs the client to not
+  leak.
+- A fixed static buffer in the shim, its address and size reported by `hello`. Enough here, because
+  the client serialises requests and the shim runs one main-thread call at a time, so nothing can
+  be using it concurrently — and there is nothing to leak.
+
+Prefer the second unless a caller turns up that needs more than one live block.
 
 ### 3.2 Main-thread execution
 
@@ -225,12 +317,12 @@ error messages the way `DescribeUnknown` does today. Current build: UUID
 | `SaveGameThunk` | post-grant save | **dlsym** `_ZN8coregame10GameHelper8saveGameEN3net11NetworkRoleEbb`, call as `saveGame(role, 0, 0)` on the main thread |
 | `FlowConnMgrHolder` | pin fire | **dlsym** `_ZN1r21FlowConnectionManager12sm_pInstanceE` → `*(void**)addr` |
 | `GomContainer` | ability-upgrade entity scan | **dlsym** `_ZN8coregame17GameObjectManager12sm_instancesE` (or call `getInstance()`); re-verify the `GomRoleOffsets {-8,0,8}` / `GOM_TABLE 0x310` / `ENT_*` layout (§4.4) |
-| `InventoryVtable` | player-inventory scan | **RTTI walk** for `27GameInventoryComponentState` (below) |
-| `AbilityMgrSlot` | ability manager | **RTTI walk** for `30PlayerPropertiesComponentState` + heap scan for its vtable (same technique as the inventory), instead of a global slot. Re-verify `MGR_OFF_*` |
+| `InventoryVtable` | player-inventory scan | **DONE** — RTTI walk for `27GameInventoryComponentState` (below), driving `MacPlayerInventory` |
+| `AbilityMgrSlot` | ability manager | **DONE for milestones** — the object comes from `PlayerPropertiesHolder`, the route the game's own dispatcher takes, and is checked against the RTTI walk for `30PlayerPropertiesComponentState` before use (`MacPlayerProperties`). The heap-scan fallback is not built; nothing has needed it. `MGR_OFF_*` still unverified and unused |
 | `UiHudVtable` | dead code | **drop** |
 | `GiveItemFromDefinition` | item grant | **RE** (§4.3-A); per-build `Game` offset |
-| `FireApplyPin`, `FirePin` | ability grant / milestone | **RE** (§4.3-B) or superseded by semantic methods; per-build `Game` offsets |
-| `MilestoneThresholds` ×3 | milestone grant | **superseded** by `UnlockSecondaryWeaponSlot` / `UnlockCharacterModSlot` methods (§4.3-C) if they behave; else RE via the `UIAbilitiesMenu::UIAbilityMilestone` binder (exported) |
+| `FireApplyPin`, `FirePin` | ability grant / milestone | **superseded for milestones** by the methods in §4.3-C. Still needed for ability upgrades unless §4.3-B finds something better |
+| `MilestoneThresholds` ×3 | milestone grant | **dropped** — `UnlockSecondaryWeaponSlot` / `UnlockCharacterModSlot` (§4.3-C) do behave, confirmed in game. No thresholds, no high-water mark, no reward pin |
 
 RTTI vtable walk (done at runtime in the shim, Itanium ABI) — implemented in `native/apshim/src/rtti.cpp`:
 1. In the `Game` image, find **every** NUL-terminated occurrence of `"27GameInventoryComponentState"`.
@@ -379,17 +471,32 @@ are dropped — one freed and reused in that gap differs at nearly every offset 
 
 ### 4.5 Profile record (proposal)
 
+As built (`Memory/Mac/MacGameBuildProfile.cs`), with the values for 1.34:
+
 ```
 MacGameBuildProfile {
   Name = "Steam macOS 1.34 (build 21225456)",
   Uuid = "CF65DC88-F5CE-38A4-8A2A-21FD5F43F14B",
-  // Game image offsets (slide added at runtime from `hello`)
-  GiveItemFromDefinition, ApplyAbilityUpgrade, UnlockSecondaryWeaponSlot, UnlockCharacterModSlot,
-  // struct layout, defaulted from the Windows build and checked before use
-  Inventory = InventoryLayout { IsPlayer, NetRole, ItemCount },
-  // still to add with §4.3-B/D: MgrOff*, GomTable, EntInstanceGid, EntArchetypeGid
+
+  // Game image offsets; the runtime slide from `hello` is added on use
+  GiveItemFromDefinition    = 0,          // §4.3-A, not yet found
+  ApplyAbilityUpgrade       = 0,          // §4.3-B, not yet found
+  UnlockSecondaryWeaponSlot = 0x87c51c,   // confirmed in game
+  UnlockCharacterModSlot    = 0x87c57c,   // confirmed in game
+  PlayerPropertiesHolder    = 0xe68d60,   // *(*(base+this) + 0x20) is the object the two are called on
+
+  // struct layout, measured on this build (§4.4)
+  Inventory = InventoryLayout { IsPlayer = 0x45, NetRole = 0x10, ItemCount = 0 /* unmapped */ },
 }
 ```
+
+`MissingAddresses()` reports the zeroes by name, and the startup banner prints them, so a player on
+an unfinished build is told which features do not work rather than left to find out.
+
+Everything symbol- or RTTI-derived is deliberately **not** in the record — the frame pump, `saveGame`,
+the object manager, the flow-connection singleton, and every vtable the scans need. Those are
+resolved at runtime by name and survive a game update untouched. What is in the record is exactly
+what a game update invalidates, which is the list to re-derive with `tools/` when one lands.
 Everything symbol- or RTTI-derived is *not* in the record; it is resolved at runtime and therefore
 survives game updates. `MissingAddresses()` semantics stay as today.
 
@@ -520,6 +627,35 @@ Goal: keep this memory-free.
   pump ticking, whether the wrapper is installed); new commands `install-launcher`, `--launch`.
 - Keep `Process.GetProcessesByName("Game")` only for messages; readiness comes from the socket.
 
+### 8.1 As built
+
+The list above is the plan; it diverged. What is actually in `Memory/Mac/`, so nobody goes looking
+for the rest:
+
+| File | Does |
+|---|---|
+| `ShimClient.cs` | socket, framing, events, reconnect, and every op as a method |
+| `MacGameBuildProfile.cs` | the profile and its registry, plus `InventoryLayout` (§4.5) |
+| `MacGameFlowController.cs` | clearance and sector flags, by CRC scan — needs no address |
+| `MacPlayerInventory.cs` | finds the player's inventory: RTTI walk, heap sweep, rank by role |
+| `MacPlayerProperties.cs` | finds the object the milestone methods are called on, vtable-checked |
+| `MacLayoutProbe.cs` | compares instances, and diffs one object over time, to locate fields (§4.4) |
+| `MacGranters.cs` | `MacItemGranter` (still unmapped) and `MacAbilityGranter` (milestones work) |
+
+Deliberately **not** built, each because nothing needed it:
+
+- `ShimGameMemory : IGameMemory` — the ops are called directly on `ShimClient`. An interface with
+  one implementation, wrapping another interface with one implementation, would not have paid.
+- `ShimSaveWatcher` — the save turned out to be a real file in a findable place (§7), so the
+  memory-scan fallback never had to exist.
+- `Memory/Common/` — the shared pieces are shared where it was free (`GameFlowNodes`, `PointerRange`
+  are used by both platforms as they stand). Lifting the rest means editing the Windows classes,
+  which ship and cannot be tested here; §3 says leave them alone, and that still holds.
+- `install-launcher` and `--launch` — Phase 4 UX. `make -C native/apshim install` does the job in the
+  meantime and prints the launch-option line.
+
+Commands that do exist: `dump-save`, `probe-game`, `try-unlock` (§0.6).
+
 ## 9. Shim implementation notes
 
 - Files: `native/apshim/{shim.cpp, ipc.cpp, symbols.cpp, rtti.cpp, mainthread.cpp, log.cpp}`,
@@ -567,13 +703,20 @@ Goal: keep this memory-free.
 - RTTI `vtable` op + inventory candidate scan; confirm §4.4 offsets. Done when the player inventory
   object is found and re-found after a save load — which is what `Ap.Control probe-game` prints.
 
-**Phase 3 — Grants (RE-bound; 3–6 days)**
-- Map §4.3 A–D in Ghidra; fill `MacGameBuildProfile`; add semantic ops; implement
-  `MacItemGranter`, `MacAbilityGranter`; call `saveGame` after mutating grants.
+**Phase 3 — Grants (RE-bound) — IN PROGRESS, half done**
+- Map §4.3 A–D; fill `MacGameBuildProfile`; implement `MacItemGranter`, `MacAbilityGranter`.
 - Done when: an inventory GID grant appears in-game and in the next save; an ability upgrade grant
   shows as bought in the (locked) Abilities menu; progressive milestones add the weapon slot and
   both mod slots; all three survive a reload; the "held until a save is loaded" deferral behaves as
   on Windows.
+- **Done:** §4.3-C. Both milestone methods found, called in a live game, and both slots appeared.
+  `MacAbilityGranter.GrantMilestoneAsync` grants for real; they are idempotent and self-persisting,
+  so there is no deferral or save to arrange around them.
+- **Remaining:** §4.3-A (`GiveItemFromDefinition`) and §4.3-B (`ApplyAbilityUpgrade`), plus somewhere
+  in the game's address space for the item grant's GID (§3.1). §0.6 has the order to take them in.
+- Two corrections to this plan came out of the half that is done, both recorded where they belong:
+  the milestone methods **save themselves**, so a grant must not save again (§4.3-C); and the
+  mod-slot method takes a **milestone level rather than a slot index**.
 
 **Phase 4 — Ship (1 day)**
 - CI: add a `macos-latest` job (arm64 runner) that builds the dylib, publishes client + patcher for
@@ -611,5 +754,20 @@ nm -u  "$GAME/Contents/MacOS/Game" | c++filt | grep DynamicEntitySpawner   # pro
 strings -n 6 "$GAME/Contents/MacOS/Game" | grep -n 'UnlockSecondaryWeaponSlot\|SetGlobalBoolVariable\|Give all ability'
 vmmap <pid> | grep libapcontrol                       # is the shim loaded?
 tail -f ~/Library/Logs/Ap.Control/shim.log
+
+make -C native/apshim check                           # shim end to end, no game needed
 Ap.Control probe-game                                 # build, pump, RTTI walk, inventory scan
+Ap.Control probe-game --layout 30PlayerPropertiesComponentState    # where a class keeps its fields
+Ap.Control try-unlock weapon-slot                     # call a mapped address for real (changes the game)
+```
+
+Reading the binary (`tools/README.md` has the rest):
+
+```
+cd tools && python3 -i macho.py
+>>> [hex(a) for a in refs_to(find_string('UnlockSecondaryWeaponSlot')[0][0])]   # who mentions it
+>>> vtable_of('27GameInventoryComponentState')                                  # its vtables
+>>> callers_of(list(stubs_for('spawnAt'))[0])                                    # who calls an engine function
+
+xcrun llvm-objdump --disassemble --start-address=0x10087c51c --stop-address=0x10087c57c "$GAME/Contents/MacOS/Game"
 ```
