@@ -249,6 +249,63 @@ int main(int argc, char** argv) {
             pass("call delivers x0-x7 and d0-d1 correctly, on the game's own thread");
     }
 
+    // --- scratch: an argument passed by address ------------------------------------------------
+    //
+    // The two grants both pass a structure the client builds and a float the client chooses, so
+    // this is that path whole: hello names a buffer inside the game, write puts bytes in it, and
+    // call hands the callee its address in x1 and the float in s0. Testing the pieces separately
+    // would not catch a float written as a double, which is the mistake that costs nothing at the
+    // call and everything at the callee.
+    uint64_t scratch = 0, scratch_len = 0;
+    uint64_t deref = 0;
+    if (!field_u64(hello, "scratch", scratch) || scratch == 0 ||
+        !field_u64(hello, "scratch_len", scratch_len) || scratch_len < 24) {
+        fail("hello did not report a usable scratch buffer");
+    } else if (!field_u64(request("12 sym ap_test_deref_probe"), "addr", deref) || deref == 0) {
+        fail("sym could not resolve the deref probe");
+    } else {
+        pass("hello reports a scratch buffer of " + std::to_string(scratch_len) + " bytes");
+
+        uint64_t payload = 7;
+        std::string header = "13 write " + std::to_string(scratch) + " 8";
+        send_frame(kText, header.data(), header.size());
+        send_frame(kBinary, &payload, sizeof payload);
+
+        uint8_t kind = 0;
+        std::vector<uint8_t> body;
+        std::string response;
+        while (recv_frame(kind, body))
+            if (kind == kJson) {
+                response = std::string(body.begin(), body.end());
+                break;
+            }
+
+        if (!ok(response)) {
+            fail("the scratch buffer is not writable: " + response);
+        } else {
+            float scale = 6.0f;
+            uint32_t bits;
+            std::memcpy(&bits, &scale, sizeof bits);
+
+            std::string line = "14 call " + std::to_string(deref) + " " + std::to_string(scratch);
+            for (int i = 1; i < 8; ++i) line += " 0";
+            line += " " + std::to_string(static_cast<uint64_t>(bits));  // d0's low half is s0
+            for (int i = 1; i < 8; ++i) line += " 0";
+            line += " 5000";
+
+            std::string call = request(line);
+            uint64_t result = 0;
+            field_u64(call, "result", result);
+            if (!ok(call))
+                fail("the scratch call failed: " + call);
+            else if (result != 42)
+                fail("a float argument did not arrive in s0: got " + std::to_string(result) +
+                     ", expected 42");
+            else
+                pass("call passes a scratch pointer in x0 and a float in s0");
+        }
+    }
+
     // --- vtable: the RTTI walk ----------------------------------------------------------------
     //
     // Checked against a live instance rather than against an address computed here, because the

@@ -233,6 +233,8 @@ std::string op_hello(uint64_t id) {
         .num("pid", static_cast<uint64_t>(getpid()))
         .flag("ticking", mainthread::ticking())
         .num("beats", mainthread::heartbeat())
+        .num("scratch", memory::scratch())
+        .num("scratch_len", memory::scratch_size())
         .raw("images", list)
         .str();
 }

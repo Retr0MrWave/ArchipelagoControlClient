@@ -115,6 +115,15 @@ size_t write(uint64_t addr, const void* data, size_t len) {
     return kr == KERN_SUCCESS ? len : 0;
 }
 
+/// Over-sized on purpose: the structures that go here are 8 and 24 bytes, and a page of slack
+/// costs nothing against being one byte short of some future caller. 16-byte aligned so a callee
+/// that reads it with paired or vector loads is not surprised.
+alignas(16) uint8_t g_scratch[256];
+
+uint64_t scratch() { return reinterpret_cast<uint64_t>(g_scratch); }
+
+size_t scratch_size() { return sizeof g_scratch; }
+
 bool is_executable(uint64_t addr) {
     if (addr == 0 || addr >= kUserSpaceLimit) return false;
 

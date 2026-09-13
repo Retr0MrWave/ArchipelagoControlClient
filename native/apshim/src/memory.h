@@ -29,6 +29,19 @@ size_t read(uint64_t addr, void* out, size_t len);
 /// Write, refusing anything that is not in a writable mapping. Returns bytes written.
 size_t write(uint64_t addr, const void* data, size_t len);
 
+/// A small, permanently mapped buffer inside the game, for arguments that are passed by address.
+///
+/// Some of the game's own methods take a pointer to a structure rather than a value -
+/// GameInventoryComponentState's give-item takes a GlobalIDPointer, the ability-upgrade grant
+/// takes a GlobalID - and the client has no other way to put bytes somewhere the game can read
+/// them. It writes the structure here and passes this address.
+///
+/// A fixed buffer rather than an alloc/free pair because there is never more than one live block:
+/// the client serialises its requests and the pump runs one queued call at a time, so nothing can
+/// be using this while something else fills it. It also means there is nothing to leak.
+uint64_t scratch();
+size_t scratch_size();
+
 /// Whether an address lies in mapped, executable memory - i.e. whether it could be a function.
 ///
 /// This is the check that makes the RTTI walk safe. Distinguishing a vtable from the other

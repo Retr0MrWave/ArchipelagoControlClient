@@ -34,7 +34,8 @@ static async Task<int> RunClientAsync(string[] args)
             "                  [--ui-port <n>] [--no-ui]\n" +
             "       Ap.Control dump-save [<path>]\n" +
             "       Ap.Control probe-game [--layout [<rtti-name>]] [--snapshot <path>]\n" +
-            "       Ap.Control try-unlock weapon-slot | mod-slot [<0-3>]\n\n" +
+            "       Ap.Control try-unlock weapon-slot | mod-slot <0-3>\n" +
+            "                            | ability <gid> | item <gid> [<amount>]\n\n" +
             "With --server and --username the client connects on startup as before. Without them it\n" +
             "waits for the in-game Archipelago page to supply the details.\n\n" +
             "dump-save parses a save and prints the location checks it would report, without\n" +
@@ -45,9 +46,9 @@ static async Task<int> RunClientAsync(string[] args)
             "finds objects but none of them the player's. --snapshot records the player's object and,\n" +
             "on a later run, reports what changed — which is how to find a field that has no shape of\n" +
             "its own, like an item count. macOS only.\n\n" +
-            "try-unlock calls one of the milestone functions in the running game, to confirm the\n" +
+            "try-unlock calls one of the mapped game functions in the running game, to confirm the\n" +
             "address found by reading the binary is the function it looks like. It changes your\n" +
-            "game; nothing is saved unless you save. macOS only.");
+            "game, and the two unlock functions save themselves. macOS only.");
         return 0;
     }
 
@@ -270,8 +271,8 @@ static int DumpSave(string[] args)
 }
 
 /// <summary>
-/// Call one of the milestone methods in the running game, to find out whether the address found by
-/// reading the binary is the function it looks like.
+/// Call one of the mapped game functions in the running game, to find out whether the address
+/// found by reading the binary is the function it looks like.
 ///
 /// This changes the player's game, which is the point — there is no way to confirm a function does
 /// what the disassembly says other than running it and looking. So it does everything it can before
@@ -279,28 +280,53 @@ static int DumpSave(string[] args)
 /// pump has to be ticking, since a call queued against a paused game only waits; and it says what
 /// it is about to do, with the address, before doing it.
 ///
-/// Deliberately not part of the granter path. When these addresses are confirmed the granters will
-/// call them for real, and this stays as the way to answer "is this still the right address?" after
-/// a game update.
+/// Deliberately not part of the granter path. The granters call these for real; this stays as the
+/// way to answer "is this still the right address?" after a game update, one function at a time,
+/// with the arguments printed.
 /// </summary>
 static int TryUnlock(string[] args)
 {
-    string? what = args.Skip(1).FirstOrDefault(a => !a.StartsWith("--", StringComparison.Ordinal));
-    if (!OperatingSystem.IsMacOS() || what is null or not ("weapon-slot" or "mod-slot"))
+    string[] positional = [.. args.Skip(1).Where(a => !a.StartsWith("--", StringComparison.Ordinal))];
+    string? what = positional.FirstOrDefault();
+    if (!OperatingSystem.IsMacOS() ||
+        what is null or not ("weapon-slot" or "mod-slot" or "ability" or "item"))
     {
         Console.Error.WriteLine(OperatingSystem.IsMacOS()
-            ? "Usage: Ap.Control try-unlock weapon-slot | mod-slot [<0-3>]"
+            ? "Usage: Ap.Control try-unlock weapon-slot\n"
+            + "                             mod-slot <0-3>            milestone level, not a slot index\n"
+            + "                             ability  <definition-gid>\n"
+            + "                             item     <definition-gid> [<amount>]"
             : "try-unlock drives the macOS helper dylib; this platform drives the game directly.");
         return 1;
     }
 
+    // Every argument after the target is that target's: a milestone level, or a definition GID and
+    // an optional engine parameter.
     int slot = 0;
+    ulong gid = 0;
+    float amount = 1.0f;
+    string? argument = positional.Skip(1).FirstOrDefault();
+
     if (what == "mod-slot")
     {
-        string? given = args.Skip(2).FirstOrDefault(a => !a.StartsWith("--", StringComparison.Ordinal));
-        if (given is not null && (!int.TryParse(given, out slot) || slot is < 0 or > 3))
+        if (argument is not null && (!int.TryParse(argument, out slot) || slot is < 0 or > 3))
         {
-            Console.Error.WriteLine($"try-unlock: the mod slot must be 0 to 3, got '{given}'");
+            Console.Error.WriteLine($"try-unlock: the mod slot must be 0 to 3, got '{argument}'");
+            return 1;
+        }
+    }
+    else if (what is "ability" or "item")
+    {
+        if (argument is null || !TryParseGid(argument, out gid) || gid == 0)
+        {
+            Console.Error.WriteLine(
+                $"try-unlock: {what} needs a definition GID, e.g. 0x1234abcd0000004d.");
+            return 1;
+        }
+        if (positional.Skip(2).FirstOrDefault() is { } given &&
+            !float.TryParse(given, out amount))
+        {
+            Console.Error.WriteLine($"try-unlock: the amount must be a number, got '{given}'");
             return 1;
         }
     }
@@ -326,16 +352,34 @@ static int TryUnlock(string[] args)
 
     Console.WriteLine($"Build:  {profile.Name}");
 
-    MacPlayerProperties.Located found =
-        new MacPlayerProperties(shim).Locate(profile, game.Base, profile.Inventory);
-    if (found.Problem is { } problem)
+    // Which object the call goes to: the item grant is a method on the player's inventory, the
+    // other three on the player-properties object the game's own dispatcher uses.
+    long self;
+    if (what == "item")
     {
-        Console.Error.WriteLine($"try-unlock: {problem}");
-        return 1;
+        MacPlayerInventory.Survey survey = new MacPlayerInventory(shim).Scan(profile.Inventory);
+        if (survey.Problem is { } trouble)
+        {
+            Console.Error.WriteLine($"try-unlock: {trouble}");
+            return 1;
+        }
+        self = survey.Chosen;
+        Console.WriteLine($"Object: 0x{self:x} — {MacPlayerInventory.RttiName}, "
+            + $"{survey.Candidates.Count} player replica(s) of {survey.Instances}");
     }
-
-    Console.WriteLine($"Object: 0x{found.Address:x} — {MacPlayerProperties.RttiName}, "
-        + $"vtable confirmed, network role {found.Role}");
+    else
+    {
+        MacPlayerProperties.Located found =
+            new MacPlayerProperties(shim).Locate(profile, game.Base, profile.Inventory);
+        if (found.Problem is { } trouble)
+        {
+            Console.Error.WriteLine($"try-unlock: {trouble}");
+            return 1;
+        }
+        self = found.Address;
+        Console.WriteLine($"Object: 0x{self:x} — {MacPlayerProperties.RttiName}, "
+            + $"vtable confirmed, network role {found.Role}");
+    }
 
     // A call queued against a game that is not running frames simply waits for its timeout, which
     // reads as "the address is wrong" when it means "the game is at a menu".
@@ -346,11 +390,45 @@ static int TryUnlock(string[] args)
         return 1;
     }
 
-    (long offset, string name, ulong[] arguments) = what == "weapon-slot"
-        ? (profile.UnlockSecondaryWeaponSlot, "UnlockSecondaryWeaponSlot",
-            new[] { (ulong)found.Address })
-        : (profile.UnlockCharacterModSlot, "UnlockCharacterModSlot",
-            new[] { (ulong)found.Address, (ulong)slot });
+    // The two grants take a GlobalIDPointer by address, so the GID has to go somewhere inside the
+    // game first. The shim keeps a buffer for exactly this and reports it in hello.
+    ulong[] doubles = [];
+    long definition = 0;
+    if (what is "ability" or "item")
+    {
+        if (hello.Scratch == 0 || hello.ScratchLength < 0x18)
+        {
+            Console.Error.WriteLine("try-unlock: the shim running inside Control predates the "
+                + "item and ability grants. Quit Control, run `make -C native/apshim install`, and "
+                + "start it again — a dylib is mapped at process start, so reinstalling it while "
+                + "the game is running does not replace the copy already loaded.");
+            return 1;
+        }
+
+        byte[] pointer = new byte[0x18];
+        BitConverter.TryWriteBytes(pointer, gid);
+        if (!shim.Write((long)hello.Scratch, pointer))
+        {
+            Console.Error.WriteLine("try-unlock: the shim's scratch buffer could not be written.");
+            return 1;
+        }
+        definition = (long)hello.Scratch;
+        Console.WriteLine($"GID:    0x{gid:x16} placed at 0x{definition:x}");
+    }
+
+    (long offset, string name, ulong[] arguments, string shown) = what switch
+    {
+        "weapon-slot" => (profile.UnlockSecondaryWeaponSlot, "UnlockSecondaryWeaponSlot",
+            new[] { (ulong)self }, $"0x{self:x}"),
+        "mod-slot" => (profile.UnlockCharacterModSlot, "UnlockCharacterModSlot",
+            new[] { (ulong)self, (ulong)slot }, $"0x{self:x}, {slot}"),
+        "ability" => (profile.ApplyAbilityUpgrade, "UnlockAbilityUpgrade",
+            new[] { (ulong)self, (ulong)definition }, $"0x{self:x}, 0x{definition:x}"),
+        _ => (profile.GiveItemFromDefinition, "GiveItemFromDefinition",
+            new[] { (ulong)self, (ulong)definition }, $"0x{self:x}, 0x{definition:x}, {amount}"),
+    };
+
+    if (what == "item") doubles = [BitConverter.SingleToUInt32Bits(amount)];
 
     if (offset == 0)
     {
@@ -359,10 +437,9 @@ static int TryUnlock(string[] args)
     }
 
     ulong function = game.Base + (ulong)offset;
-    Console.WriteLine($"Calling {name}(0x{found.Address:x}"
-        + (what == "mod-slot" ? $", {slot}" : "") + $") at Game+0x{offset:x} = 0x{function:x}");
+    Console.WriteLine($"Calling {name}({shown}) at Game+0x{offset:x} = 0x{function:x}");
 
-    ShimCall result = shim.Call(function, arguments, []);
+    ShimCall result = shim.Call(function, arguments, doubles);
     if (!result.Ok)
     {
         Console.Error.WriteLine($"try-unlock: the call did not complete — {result.Error}");
@@ -371,10 +448,31 @@ static int TryUnlock(string[] args)
 
     Console.WriteLine($"  returned 0x{result.Result:x} after {result.Beats} pump beat(s)");
     Console.WriteLine();
-    Console.WriteLine("The game is still running, so look now: open the loadout or Abilities screen");
-    Console.WriteLine("and see whether the slot appeared. Nothing has been saved — save in game if");
-    Console.WriteLine("you want it kept, or reload to discard it.");
+    Console.WriteLine(what switch
+    {
+        "item" => "A non-zero return is the item the game created. Open the inventory and look for\n"
+                + "it; if it could not go straight in, the game will have dropped it at your feet.\n"
+                + "Nothing has been saved — save in game if you want it kept, or reload to discard it.",
+        "ability" => "The game is still running, so look now: open the Abilities screen and see\n"
+                + "whether the upgrade reads as bought. This one saves itself, so it is already\n"
+                + "on disk — reloading will not discard it.",
+        _ => "The game is still running, so look now: open the loadout or Abilities screen\n"
+           + "and see whether the slot appeared. This one saves itself, so it is already on\n"
+           + "disk — reloading will not discard it.",
+    });
     return 0;
+}
+
+/// <summary>
+/// A content GID as a person would type it: hex with or without an 0x prefix, or decimal.
+/// </summary>
+static bool TryParseGid(string text, out ulong gid)
+{
+    if (text.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+        return ulong.TryParse(text.AsSpan(2), System.Globalization.NumberStyles.HexNumber, null, out gid);
+
+    return ulong.TryParse(text, out gid)
+        || ulong.TryParse(text, System.Globalization.NumberStyles.HexNumber, null, out gid);
 }
 
 /// <summary>
@@ -410,6 +508,13 @@ static int ProbeGame(string[] args)
     }
 
     Console.WriteLine($"Shim:  connected on {shim.SocketPath} (game pid {hello.Pid})");
+    // Worth a line of its own: a shim built before the grants existed answers everything else
+    // correctly and then fails only at the one call that needs somewhere to put a definition GID.
+    Console.WriteLine(hello.Scratch != 0
+        ? $"       {hello.ScratchLength}-byte scratch buffer at 0x{hello.Scratch:x}"
+        : "       no scratch buffer — the loaded dylib predates the item and ability grants. "
+          + "Quit Control, `make -C native/apshim install`, start it again (reinstalling under a "
+          + "running game does not replace the copy it has mapped)");
     Console.WriteLine(hello.PumpTicking
         ? $"Pump:  ticking, {hello.Beats:N0} frame(s) so far"
         : $"Pump:  not ticking, {hello.Beats:N0} frame(s) so far — at a menu or paused, so anything "
@@ -418,8 +523,9 @@ static int ProbeGame(string[] args)
         Console.WriteLine($"Image: {game.Name} {game.Uuid} loaded at 0x{game.Base:x}");
     Console.WriteLine(MacGameBuildRegistry.Describe(hello));
 
-    // The RTTI walk. Both classes are reported because the second is what the ability grants will
-    // need in Phase 3, and a build that renamed either is worth knowing about now.
+    // The RTTI walk. Both classes are reported because the grants need both — the item grant is a
+    // method on the first, the ability and milestone grants on the second — and a build that
+    // renamed either is worth knowing about before a call goes out to a wrong object.
     Console.WriteLine();
     foreach (string rttiName in new[] { MacPlayerInventory.RttiName, "30PlayerPropertiesComponentState" })
     {

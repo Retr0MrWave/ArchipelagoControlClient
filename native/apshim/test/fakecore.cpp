@@ -64,4 +64,14 @@ uint64_t ap_test_call_probe(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint
     return a + b + c + d + e + f + g + h + static_cast<uint64_t>(i) + static_cast<uint64_t>(j);
 }
 
+/// The exact shape of the two grants: a structure passed by address, and a `float` rather than a
+/// `double`. Both halves are easy to get wrong in a way nothing complains about. The structure has
+/// to be somewhere inside the game, which is what the shim's scratch buffer is for; and a float
+/// argument arrives in s0, the low half of d0, so a caller that writes the double bit pattern of
+/// 1.0 into d0 passes a callee expecting `float` a denormal near zero instead.
+uint64_t ap_test_deref_probe(const uint64_t* pointer, float scale) {
+    if (pointer == nullptr) return 0;
+    return *pointer * static_cast<uint64_t>(scale);
+}
+
 }  // extern "C"

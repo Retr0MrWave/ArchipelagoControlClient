@@ -9,7 +9,14 @@ namespace Ap.Control.Memory.Mac
     public readonly record struct ShimImage(string Name, ulong Base, long Slide, string Uuid, bool IsExecutable);
 
     /// <summary>What the shim says about the process it is living in.</summary>
-    public readonly record struct ShimHello(int Pid, bool PumpTicking, ulong Beats, IReadOnlyList<ShimImage> Images)
+    /// <param name="Scratch">
+    /// A buffer inside the game the client may write into and pass the address of. Several of the
+    /// game's own methods take a pointer to a structure — the item grant takes a GlobalIDPointer,
+    /// the ability grant a GlobalID — and this is the only memory the client can put one in. One
+    /// fixed buffer is enough because requests are serialised and the pump runs one call at a time.
+    /// </param>
+    public readonly record struct ShimHello(int Pid, bool PumpTicking, ulong Beats,
+        ulong Scratch, int ScratchLength, IReadOnlyList<ShimImage> Images)
     {
         /// <summary>The main executable — the Game binary, whose UUID keys the build profile.</summary>
         public ShimImage? Executable => Images.FirstOrDefault(i => i.IsExecutable) is { Name.Length: > 0 } image
@@ -233,9 +240,16 @@ namespace Ap.Control.Memory.Mac
                             image.GetProperty("uuid").GetString() ?? "",
                             image.GetProperty("exe").GetBoolean()));
 
+                // Older shims predate the scratch buffer. Reporting zero lets the granters say
+                // "this shim cannot carry an item definition" rather than write to address 0.
+                ulong scratch = root.TryGetProperty("scratch", out JsonElement at) ? at.GetUInt64() : 0;
+                int scratchLength = root.TryGetProperty("scratch_len", out JsonElement len)
+                    ? len.GetInt32()
+                    : 0;
+
                 return new ShimHello(root.GetProperty("pid").GetInt32(),
                     root.GetProperty("ticking").GetBoolean(),
-                    root.GetProperty("beats").GetUInt64(), images);
+                    root.GetProperty("beats").GetUInt64(), scratch, scratchLength, images);
             }
         }
 

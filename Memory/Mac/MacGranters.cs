@@ -44,6 +44,48 @@ namespace Ap.Control.Memory.Mac
         }
 
         /// <summary>
+        /// A <c>r::GlobalIDPointer</c> naming <paramref name="gid"/>, placed somewhere the game can
+        /// read it, with its address — or 0 and a reason.
+        /// </summary>
+        /// <remarks>
+        /// Both grants take one of these by address rather than a GID by value, so the client has to
+        /// put 24 bytes inside the game before it can call anything. The shim keeps one fixed buffer
+        /// for the purpose, whose address <c>hello</c> reports; that is enough because requests are
+        /// serialised and the pump runs one queued call at a time, so nothing else can be using it.
+        ///
+        /// Everything but the GID is zeroed. The other three fields are a resolved-pointer cache, a
+        /// generation and a spin lock, and the engine's own copy-assign fills them in from the map —
+        /// it takes the lock, so a leftover 1 in that byte would hang the game on its own scratch.
+        /// </remarks>
+        protected (long Address, string? Problem) PlaceGid(ulong gid)
+        {
+            if (Shim.Hello() is not { } hello)
+                return (0, "the shim stopped answering.");
+
+            // Says "restart", not "reinstall", on purpose. A dylib is mapped at process start, so
+            // the file on disk can already be the new one while the running game is still executing
+            // the old one — and then reinstalling it again changes nothing.
+            if (hello.Scratch == 0 || hello.ScratchLength < GlobalIdPointerSize)
+                return (0, "the shim running inside Control predates the item and ability grants, "
+                         + "so there is nowhere to put a definition GID. Quit Control, run "
+                         + "`make -C native/apshim install`, and start it again — reinstalling "
+                         + "while it is running does not replace the copy it has already loaded.");
+
+            byte[] pointer = new byte[GlobalIdPointerSize];
+            BitConverter.TryWriteBytes(pointer, gid);
+
+            return Shim.Write((long)hello.Scratch, pointer)
+                ? ((long)hello.Scratch, null)
+                : (0, "the shim's scratch buffer could not be written.");
+        }
+
+        /// <summary>
+        /// sizeof(r::GlobalIDPointer&lt;T&gt;): the GID, a resolved-pointer cache, a generation and
+        /// a spin-lock byte.
+        /// </summary>
+        private const int GlobalIdPointerSize = 0x18;
+
+        /// <summary>
         /// Why a grant cannot proceed, in terms a player can act on, or null if it can.
         /// </summary>
         protected string? WhyNot(Func<MacGameBuildProfile, long> address, string what)
@@ -74,17 +116,15 @@ namespace Ap.Control.Memory.Mac
     /// <summary>
     /// Spawns inventory items into the running game on macOS.
     ///
-    /// The object half of this is done: <see cref="MacPlayerInventory"/> finds the player's
-    /// inventory by walking the binary's RTTI for the class's vtable and sweeping the heap for it,
-    /// with no per-build address involved.
+    /// Neither half of this needs a heap scan for a function. <see cref="MacPlayerInventory"/> finds
+    /// the player's inventory by walking the binary's RTTI for the class's vtable, and the method
+    /// called on it is the one the game binds for its own scripts —
+    /// <c>GameInventoryComponentState::(GlobalIDPointer&lt;LootDropItem&gt;, float)</c>. It creates
+    /// the item and adds it to the inventory; if it cannot go straight in, the game spawns the drop
+    /// at the player instead, which is the same behaviour a mission reward has.
     ///
-    /// STILL TO DO, and deliberately not guessed at: <c>MacGameBuildProfile.GiveItemFromDefinition</c>,
-    /// the equivalent of the Windows FUN_1403b6c30. It is a method on the class whose vtable the
-    /// scan already resolves — the one taking a GID and a float that reaches DynamicEntitySpawner.
-    /// Once it is filled in, the grant is one main-thread request: this(x0), fire flag(x1), GID
-    /// pointer(x2), amount(d0), which the shim already supports and has a test for. The GID needs
-    /// somewhere in the game's address space to live for the duration of the call, which is the
-    /// one piece of protocol the shim still lacks.
+    /// Unlike the milestone methods this one does not save, matching the Windows granter, which
+    /// also leaves the save to the next one the game takes.
     /// </summary>
     internal sealed class MacItemGranter : MacGranterBase, IItemGranter
     {
@@ -111,44 +151,83 @@ namespace Ap.Control.Memory.Mac
             return Task.CompletedTask;
         }
 
-        public Task<GrantResult> GiveItemAsync(ulong gid, float parameter = 1.0f,
+        /// <summary>
+        /// Give the player one item, by the GID of its definition.
+        /// </summary>
+        /// <param name="parameter">
+        /// The item's engine parameter — the roll quality for a weapon mod, and 1.0 for everything
+        /// that does not use it. It reaches the callee in s0, so it is a <c>float</c> all the way
+        /// down; see <see cref="ShimClient.Call"/> for how the low half of d0 becomes s0.
+        /// </param>
+        public async Task<GrantResult> GiveItemAsync(ulong gid, float parameter = 1.0f,
             CancellationToken cancellationToken = default)
         {
             if (WhyNot(p => p.GiveItemFromDefinition, "inventory items") is { } reason)
-                return Task.FromResult(GrantResult.Fail(reason));
+                return GrantResult.Fail(reason);
 
-            return Task.FromResult(_inventory.Locate(Layout) == 0
-                ? GrantResult.Fail("the player's inventory is not in memory — is a save loaded?")
-                : GrantResult.Fail("the give-item function is mapped but the shim has nowhere to "
-                                 + "put the item definition for the call."));
+            if (Profile() is not { } profile) return GrantResult.Fail("the build is not mapped.");
+
+            long self = _inventory.Locate(Layout);
+            if (self == 0)
+                return GrantResult.Fail("the player's inventory is not in memory — is a save loaded?");
+
+            if (Shim.Pump() is { Ticking: false })
+                return GrantResult.Fail(
+                    "the game is not running frames — the grant will be retried once it is.");
+
+            (long definition, string? problem) = PlaceGid(gid);
+            if (problem is not null) return GrantResult.Fail(problem);
+
+            ShimCall call = await Task.Run(() => Shim.Call(
+                    GameBase() + (ulong)profile.GiveItemFromDefinition,
+                    [(ulong)self, (ulong)definition],
+                    [BitConverter.SingleToUInt32Bits(parameter)]), cancellationToken)
+                .ConfigureAwait(false);
+
+            if (!call.Ok) return GrantResult.Fail(call.Error ?? "the call did not complete");
+
+            // The method hands back the item it created, and 0 when it made nothing — which is
+            // what an unknown definition GID looks like from here.
+            return new GrantResult { Ok = true, Accepted = call.Result != 0 };
         }
     }
 
     /// <summary>
     /// Grants ability-tree upgrades and point milestones on macOS.
     ///
-    /// STILL TO DO: <c>ApplyAbilityUpgrade</c>, <c>UnlockSecondaryWeaponSlot</c> and
-    /// <c>UnlockCharacterModSlot</c> in the profile. The shipped Game binary makes these unusually
-    /// cheap to find — it still contains the debug page's button labels ("Give all ability unlocks
-    /// + upgrades") and the server message manager's script-method name table, so each is one xref
-    /// away in a disassembler rather than a signature hunt.
+    /// Every one of these is a method the game already has, reached the way the game reaches it.
+    /// All three come out of the RPC dispatcher — <c>UnlockAbilityUpgrade</c>,
+    /// <c>UnlockSecondaryWeaponSlot</c>, <c>UnlockCharacterModSlot</c> — and all three are called on
+    /// the one object <see cref="MacPlayerProperties"/> locates.
     ///
-    /// Note that the milestone path gets simpler than Windows': UnlockSecondaryWeaponSlot and
-    /// UnlockCharacterModSlot are real methods, so there is no need to raise a spent-points
-    /// high-water mark and fire a reward pin, and no need for the three threshold globals.
+    /// That makes both paths simpler than their Windows counterparts, which have to assemble the
+    /// same effects out of parts. The ability grant here does not need the entity-table sweep for a
+    /// live upgrade instance, nor the FlowConnectionManager and the apply-pin handle: the method
+    /// does all of that internally. The milestone grant does not need a spent-points high-water
+    /// mark, a reward pin, or the three threshold globals.
     /// </summary>
     internal sealed class MacAbilityGranter : MacGranterBase, IAbilityGranter
     {
         /// <summary>Highest milestone level the interface defines.</summary>
         private const int MaxLevel = 3;
 
+        /// <summary>
+        /// How much of the player-properties object to compare before and after a grant.
+        /// </summary>
+        /// <remarks>
+        /// Covers the ability-point counters at +0x40, which the upgrade apply adds to, and leaves
+        /// room for the milestone flags. Neither method returns anything, so this is the only
+        /// witness there is — and it is a soft one: both no-op when the player already has what is
+        /// being granted, so "nothing changed" is usually a real answer, but an apply whose whole
+        /// effect landed on the upgrade entity rather than here would read the same way. It sets
+        /// <c>Accepted</c>, never <c>Ok</c>, so a false negative costs a log line and not a grant.
+        /// </remarks>
+        private const int WitnessWindow = 0x60;
+
         private readonly MacPlayerProperties _properties;
 
         internal MacAbilityGranter(ShimClient? shim = null) : base(shim)
             => _properties = new MacPlayerProperties(Shim);
-
-        // IsReady stays the base's: it requires every address the granter needs, and ability
-        // upgrades are still unmapped. Milestones working is not the granter being ready.
 
         public Task StartAsync(CancellationToken cancellationToken = default)
         {
@@ -156,11 +235,51 @@ namespace Ap.Control.Memory.Mac
             return Task.CompletedTask;
         }
 
-        public Task<GrantResult> GrantAbilityAsync(ulong definitionGid,
+        /// <summary>
+        /// Grant one ability-tree upgrade by the GID of its definition.
+        /// </summary>
+        /// <remarks>
+        /// The method takes a definition GID, walks the player's own upgrade instances for one whose
+        /// archetype matches, and fires the ability tree's apply pin on it — the point-cost-free
+        /// path. So an upgrade the player's tree has not instantiated is simply not applied, the
+        /// same outcome the Windows granter reports when no live instance exists for the definition.
+        /// It saves on its way out, which is why this does not.
+        /// </remarks>
+        public async Task<GrantResult> GrantAbilityAsync(ulong definitionGid,
             CancellationToken cancellationToken = default)
-            => Task.FromResult(GrantResult.Fail(
-                WhyNot(p => p.ApplyAbilityUpgrade, "ability upgrades")
-                ?? "the ability-tree manager has not been located on macOS yet."));
+        {
+            if (WhyNot(p => p.ApplyAbilityUpgrade, "ability upgrades") is { } reason)
+                return GrantResult.Fail(reason);
+
+            if (Profile() is not { } profile) return GrantResult.Fail("the build is not mapped.");
+
+            ulong gameBase = GameBase();
+            MacPlayerProperties.Located found =
+                _properties.Locate(profile, gameBase, profile.Inventory);
+            if (found.Problem is { } problem) return GrantResult.Fail(problem);
+
+            if (Shim.Pump() is { Ticking: false })
+                return GrantResult.Fail(
+                    "the game is not running frames — the grant will be retried once it is.");
+
+            (long definition, string? placing) = PlaceGid(definitionGid);
+            if (placing is not null) return GrantResult.Fail(placing);
+
+            // The method returns nothing, so what it did has to be read off the object.
+            byte[] before = Shim.Read(found.Address, WitnessWindow);
+
+            ShimCall call = await Task.Run(() => Shim.Call(
+                    gameBase + (ulong)profile.ApplyAbilityUpgrade,
+                    [(ulong)found.Address, (ulong)definition], []), cancellationToken)
+                .ConfigureAwait(false);
+
+            if (!call.Ok) return GrantResult.Fail(call.Error ?? "the call did not complete");
+
+            byte[] after = Shim.Read(found.Address, WitnessWindow);
+            bool changed = before.Length == after.Length && !before.AsSpan().SequenceEqual(after);
+
+            return new GrantResult { Ok = true, Accepted = changed };
+        }
 
         /// <summary>
         /// Grant a milestone by calling the game's own method for it.

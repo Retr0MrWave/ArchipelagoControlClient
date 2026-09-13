@@ -35,6 +35,10 @@ the wrong fit for macOS. Everything below was verified on the Steam build instal
   incoming name against each one it knows and calls the handler inline, so the names are referenced
   from code, not data — which is still cheap, but by a different route (§4.3-C). Searching the data
   sections for them finds nothing, and that absence is not evidence the names are unused.
+  *And it turned out cheaper still:* every `Game` function the port needs was found by name — three
+  through that dispatcher, and the item grant through the **script-binder instantiations**, whose
+  RTTI names spell out each bound method's C++ signature in full (§4.3-A). Neither a signature scan
+  nor the debug page was needed, and no address was found by pattern.
 - **"Communicate without modifying memory" — verdict:** not fully achievable for grants (§2 explains
   what was checked). What *is* memory-free stays memory-free: elevator gating (pure JS), the in-game
   UI, and location tracking (save file on disk, with the dylib only *announcing* that a save
@@ -42,7 +46,8 @@ the wrong fit for macOS. Everything below was verified on the Steam build instal
   thread" — which is the closest thing to a supported API this engine has.
 
 ## 0.5 Status
-Phases 0, 1 and 2 are built and on the `macos-port` branch. What runs today:
+Phases 0, 1 and 2 are built and on the `macos-port` branch, and Phase 3's reverse engineering is
+finished — every address the client needs is mapped and implemented. What runs today:
 - **Patcher** works against the real install. All four patches resolve their targets and dry-run
   length-neutrally with every balancer and record-boundary validator satisfied.
 - **Shim** loads, interposes the pump and `saveGame`, and serves the socket. `make -C native/apshim
@@ -56,9 +61,10 @@ Phases 0, 1 and 2 are built and on the `macos-port` branch. What runs today:
   roles 3 and 2, re-found after a reload. `Ap.Control probe-game` prints each step.
 - **Progressive milestones work** — the extra weapon slot and both mod slots. Phase 3 found the
   game's own methods for them (§4.3-C) and confirmed them by calling them in a live game.
-- **Not yet**: inventory items and ability upgrades, which need the remaining two addresses in
-  §4.3-A and §4.3-B. The profile holds zeroes rather than guesses and the granters say which
-  feature is unmapped.
+- **Item and ability grants work** — both called in a live game and both verified in the save
+  written afterwards (§4.3-A, §4.3-B). They run on the game's own methods, with the shim's scratch
+  buffer carrying the definition GID into the game. The profile has no zeroes left, and every
+  address in it has now been confirmed by running it rather than by reading it.
 
 Four things came out differently from the design below, all deliberate:
 1. **Requests are whitespace-separated tokens, not JSON** (responses are still JSON). Every argument
@@ -93,7 +99,7 @@ Written for someone who has not been here before. Everything is current as of th
 |---|---|---|
 | Xcode Command Line Tools | `clang++` builds the shim; `xcrun llvm-objdump` reads the game binary | |
 | .NET SDK 10 | client and patcher | |
-| Ghidra | decompiling the two functions still missing | `brew install ghidra`. It pulls `openjdk@21`, which Homebrew keeps keg-only, so **every** headless invocation needs `JAVA_HOME` set — see `tools/README.md` |
+| Ghidra | reading a handful of functions out; `macho.py` answers everything that is a pattern rather than data flow | `brew install ghidra`. It pulls `openjdk@21`, which Homebrew keeps keg-only, so **every** headless invocation needs `JAVA_HOME` set — see `tools/README.md` |
 | Control, Steam macOS 1.34 | every address in the profile is for this build only | `Game` LC_UUID `CF65DC88-F5CE-38A4-8A2A-21FD5F43F14B` |
 
 `tools/macho.py` needs Python 3 and no packages.
@@ -102,9 +108,15 @@ Written for someone who has not been here before. Everything is current as of th
 
 ```sh
 make -C native/apshim check     # shim, end to end, no game needed — run before and after touching it
-make -C native/apshim install   # quit Control first; renames into place
+make -C native/apshim install   # quit Control FIRST; see below
 dotnet build                    # client
 ```
+
+`install` renames into place, which does not disturb a game that is already running — and equally
+does not reach it. A running Control keeps executing the copy it mapped at launch, so a shim change
+only takes effect after quitting and relaunching. The symptom is a client that reports a capability
+missing however many times the dylib is reinstalled; `probe-game` prints the scratch buffer, and its
+absence is that.
 
 Then launch Control from Steam with the launch option of §5.1 set, and:
 
@@ -121,36 +133,26 @@ hangs for 70 seconds and then reports nothing listening, that is the client's re
 | Command | Answers |
 |---|---|
 | `probe-game` | Is the shim up, which build, is the pump ticking, can the player's inventory be found — each step printed separately, so the one that broke is visible |
-| `probe-game --layout [<rtti-name>]` | Where does this build keep a class's fields? Compares every instance in memory. Finds anything with a *shape*: a flag set on one or two objects, a two-bit network role. Takes any class, so it serves §4.3-B as well as it served the inventory |
+| `probe-game --layout [<rtti-name>]` | Where does this build keep a class's fields? Compares every instance in memory. Finds anything with a *shape*: a flag set on one or two objects, a two-bit network role. Takes any class. What it cannot find is a field with no shape — a count is any small number — which is what sends you to the disassembler (§4.4) |
 | `probe-game --layout --snapshot <path>` | What changed in the player's object between two runs? For fields with no shape — a count is any small number. Snapshot, do the thing in game, run again. The noise floor is zero, so one observation is enough. `--window 0x800` if a diff comes back empty |
-| `try-unlock weapon-slot \| mod-slot <2\|3>` | Is an address really the function it looks like? Calls it in the live game. Refuses unless the object carries the right vtable and the pump is ticking. **Changes the player's game, and the milestone methods save themselves** |
+| `try-unlock weapon-slot \| mod-slot <0-3> \| ability <gid> \| item <gid> [<amount>]` | Is an address really the function it looks like? Calls it in the live game, one function at a time, with the object and the arguments printed first. Refuses unless the object carries the right vtable and the pump is ticking. **Changes the player's game**, and everything but `item` saves itself |
 | `dump-save [<path>]` | What checks would this save report? No game, no server |
 
 ### What is done, and what the remaining work is
 
-Phases 0–2 are complete (§10). Phase 3 has two of four addresses, both confirmed by calling them in
-a live game; progressive milestones grant for real. What is left:
-
-1. **`GiveItemFromDefinition`** (§4.3-A). Search space, dead ends and the three `spawnAt` callers are
-   all recorded there. This is the bigger of the two.
-2. **A place to put the GID** — the item grant passes a pointer to a definition, and the shim has no
-   way to hand the client memory inside the game. Roughly fifteen lines: an `alloc`/`free` op over
-   `malloc`, or a fixed static scratch buffer whose address `hello` reports. A static buffer is
-   enough because the client serialises requests and one call runs at a time. Left undone only
-   because it could not be tested without the address.
-3. **`ApplyAbilityUpgrade`** (§4.3-B). The cheaper route to try first is recorded there.
-4. **Item count** (§4.4) — optional, nothing reads it, and the disassembler will answer it in a
-   minute once someone is in there anyway.
+Phases 0–3 are complete (§10). All four addresses are mapped, every one of them confirmed by
+calling it in a live game, and the profile has no zeroes. What is left is **Phase 4** — CI, README,
+`install-launcher` / `--launch`, release notes.
 
 ### Known-unknowns worth not rediscovering
 
-- Four bytes — `+0x45`, `+0x55`, `+0x60`, `+0x88` — are set on exactly the player's two inventory
-  replicas. Any locates the object; which one *means* "is the player" is unsettled (§4.4).
 - The Ghidra project lives wherever you put it and is not in the repo. Re-importing `Game` takes
-  about ten minutes and 250 MB; put it somewhere that survives the session.
+  about five minutes and 250 MB; put it somewhere that survives the session (`~/ghidra-projects`
+  is what `tools/README.md` uses).
 - Every address in the profile moves when the game updates. `tools/` exists so re-deriving them is
   a repeatable procedure rather than a fresh investigation — §4.3 records how each was found, not
-  just what it is.
+  just what it is. Two routes cover all four: the RPC dispatcher's inline name comparisons, and the
+  script-binder instantiations, whose RTTI names carry each bound method's full C++ signature.
 
 ## 1. Verified facts
 
@@ -242,7 +244,7 @@ Components:
 
 | op | params → result | notes |
 |---|---|---|
-| `hello` | → `{pid, main_thread_id, images:[{name, base, slide, uuid}]}` | `Game`'s UUID keys the build profile (§4.1) |
+| `hello` | → `{pid, ticking, beats, scratch, scratch_len, images:[{name, base, slide, uuid, exe}]}` | `Game`'s UUID keys the build profile (§4.1); `scratch` is the buffer below |
 | `dlsym` | `{sym}` → `{addr}` | `dlsym(RTLD_DEFAULT, sym)`; `sym` without the leading underscore |
 | `vtable` | `<rtti-name> [image]` → `{image, name, typeinfo, vtables:[{addr, top}]}` | §4.2. `addr` is the address point — what an instance's first word holds — so a heap scan can use it directly. Primary (`top` 0) first. |
 | `regions` | `{writable:true}` → `[{base, size, prot, share_mode}]` | `mach_vm_region_recurse` on `mach_task_self()` — unprivileged |
@@ -258,17 +260,21 @@ thin wrappers over `call_main`. In practice none has been needed: the milestone 
 `call` each with addresses the client already holds, and a wrapper per grant would move C# logic
 into the game's address space for no gain. Add one only where it buys something.
 
-**One op is genuinely missing**, and the item grant cannot be finished without it: the client has no
-way to put bytes somewhere inside the game and pass their address. `GiveItemFromDefinition` takes a
-pointer to a GID, and `write` needs a target that already exists. Two ways, both small:
+**One op was genuinely missing** — the client had no way to put bytes somewhere inside the game and
+pass their address, and both grants need that: §4.3-A takes a pointer to a 24-byte `GlobalIDPointer`
+and §4.3-B a pointer to a `GlobalID`, while `write` needs a target that already exists. Two ways were
+considered: `alloc`/`free` over `malloc`, general but leakable; or one fixed static buffer in the
+shim whose address and size `hello` reports.
 
-- `alloc <len>` → `{addr}` plus `free <addr>`, over `malloc`. General, and needs the client to not
-  leak.
-- A fixed static buffer in the shim, its address and size reported by `hello`. Enough here, because
-  the client serialises requests and the shim runs one main-thread call at a time, so nothing can
-  be using it concurrently — and there is nothing to leak.
+**Built as the second**, and it is enough: the client serialises requests and the shim runs one
+main-thread call at a time, so nothing can be using the buffer concurrently, and there is nothing to
+leak. 256 bytes, 16-byte aligned, reported as `scratch` / `scratch_len`. A shim older than the
+grants reports no buffer, and the granters say so by name rather than writing to address 0.
 
-Prefer the second unless a caller turns up that needs more than one live block.
+`native/apshim/test/checkclient.cpp` covers the whole path in one case — `hello` names the buffer,
+`write` fills it, `call` hands a callee its address and a **`float`**. The float is the half worth
+testing: it arrives in `s0`, the low word of `d0`, so a client that writes the *double* bit pattern
+of 1.0 passes a denormal near zero and the grant quietly does nothing.
 
 ### 3.2 Main-thread execution
 
@@ -318,10 +324,10 @@ error messages the way `DescribeUnknown` does today. Current build: UUID
 | `FlowConnMgrHolder` | pin fire | **dlsym** `_ZN1r21FlowConnectionManager12sm_pInstanceE` → `*(void**)addr` |
 | `GomContainer` | ability-upgrade entity scan | **dlsym** `_ZN8coregame17GameObjectManager12sm_instancesE` (or call `getInstance()`); re-verify the `GomRoleOffsets {-8,0,8}` / `GOM_TABLE 0x310` / `ENT_*` layout (§4.4) |
 | `InventoryVtable` | player-inventory scan | **DONE** — RTTI walk for `27GameInventoryComponentState` (below), driving `MacPlayerInventory` |
-| `AbilityMgrSlot` | ability manager | **DONE for milestones** — the object comes from `PlayerPropertiesHolder`, the route the game's own dispatcher takes, and is checked against the RTTI walk for `30PlayerPropertiesComponentState` before use (`MacPlayerProperties`). The heap-scan fallback is not built; nothing has needed it. `MGR_OFF_*` still unverified and unused |
+| `AbilityMgrSlot` | ability manager | **DONE** — the object comes from `PlayerPropertiesHolder`, the route the game's own dispatcher takes, and is checked against the RTTI walk for `30PlayerPropertiesComponentState` before use (`MacPlayerProperties`). Serves the ability grant and both milestones. The heap-scan fallback is not built; nothing has needed it |
 | `UiHudVtable` | dead code | **drop** |
-| `GiveItemFromDefinition` | item grant | **RE** (§4.3-A); per-build `Game` offset |
-| `FireApplyPin`, `FirePin` | ability grant / milestone | **superseded for milestones** by the methods in §4.3-C. Still needed for ability upgrades unless §4.3-B finds something better |
+| `GiveItemFromDefinition` | item grant | **DONE** — `Game+0x4f0bc0` (§4.3-A); per-build offset |
+| `FireApplyPin`, `FirePin` | ability grant / milestone | **dropped** — §4.3-B's `UnlockAbilityUpgrade` fires the apply pin itself, and §4.3-C's milestone methods need no pin at all. `FireApplyPin` is `Game+0x894f08` on this build if a fallback is ever wanted |
 | `MilestoneThresholds` ×3 | milestone grant | **dropped** — `UnlockSecondaryWeaponSlot` / `UnlockCharacterModSlot` (§4.3-C) do behave, confirmed in game. No thresholds, no high-water mark, no reward pin |
 
 RTTI vtable walk (done at runtime in the shim, Itanium ABI) — implemented in `native/apshim/src/rtti.cpp`:
@@ -351,55 +357,80 @@ The stripped `Game` is far easier than `Control_DX12.exe` was: every call into t
 import, all `Coherent::UIGT::*Binder<UIAbilitiesMenu::UIAbility>` etc. are exported, and RTTI is
 intact (Ghidra's "RTTI Analyzer" / class recovery names the vtables for you).
 
-**A. Item grant — `GiveItemFromDefinition(this, char fire, GID* def, float amount)`**
-- Narrowed, not found. `coregame::DynamicEntitySpawner::spawnAt` has exactly **three** callers in
-  `Game` — the functions starting `0x1003136a4`, `0x1004b4f70` and `0x1005829fc` (from
-  `tools/macho.py`: `callers_of` over `stubs_for('DynamicEntitySpawner7spawnAt')`).
-- All three decompiled. None is obviously it, and two can probably be set aside: `0x1003136a4`
-  and `0x1005829e0` return void, where the Windows routine returns the spawned object.
-  `0x1004b4f70(long, char*, int)` does return a pointer, but its body is dense SIMD position
-  arithmetic, which reads as spawning into the world rather than adding to an inventory.
-- Dead ends recorded so they are not re-walked: `AddToInventoryComponentState`'s vtable
-  (`0x100dd4620`, 23 entries) holds only type-info accessors in its own slots, so the flow node
-  dispatches its apply through a function pointer in content data rather than a virtual. The
-  `m_in_funcAddItem` / `m_in_funcCanAddItem` strings are referenced once each, from reflection
-  registration (`0x100506864`, `0x1005067c0`), which gives the field's offset in the content struct
-  and not the function.
-- Next: the four code references to the `"GameInventoryComponentState"` cstring (`0x1004e4df0`,
-  `0x1004ee750`, `0x1004f0248`, …) land in the class's own code region, `0x1004e4000`–`0x1004f1000`.
-  That region, plus the 71 entries of its vtable, is the search space; look for the one taking a GID
-  and a float.
-- `DropLootItem` is a dead end for this: its handler at `0x10098782c` parses a GID, a string and
-  three floats, i.e. it is the spawn-at-a-position path this section already rejected, not the
-  inventory give.
-- The inventory vtable has 71 entries (`walk_vtable`), which is the other place to look if the
-  routine turns out to be virtual after all.
-- Start from the inventory vtable (§4.2) → its `GameInventoryComponentState` methods; the
-  give-from-definition routine is the one that takes a `GlobalIDPointer`/GID and a float and calls
-  into the spawner (imports `coregame::DynamicEntitySpawner::spawnAt` / entity creation).
-- Cross-check from the script table: the `DropLootItem` / `AddToInventoryComponentState::m_in_funcApply`
-  paths end in the same function.
-- Alternative that avoids RE entirely (evaluate, not preferred): `coregame::DynamicEntitySpawner::spawnAt(GlobalIDPointer<EntityArchetype>, SIMDTransform, callback)` is exported — spawning the item at the player's feet — but it changes game feel and needs the player transform.
+**A. Item grant — `GiveItemFromDefinition` — FOUND**
+- **`Game+0x4f0bc0`**, called as `(GameInventoryComponentState* this, GlobalIDPointer* item, float
+  amount in s0)`, returning the `coregame::EntityState*` it created or 0. Note the second argument
+  is a pointer to a **24-byte `r::GlobalIDPointer`**, not to a bare GID: the parameter is a class
+  with a destructor, which AArch64 passes indirectly. Zero the whole thing and put the GID at +0 —
+  the rest is a resolved-pointer cache, a generation and a spin-lock byte, and a stale 1 in that
+  byte would hang the game inside its own copy-assign.
+- It puts the item in the inventory; where it cannot, it spawns the drop at the player and adds
+  that — which is what a mission reward does too. It does **not** save, so unlike C the grant leaves
+  the save to the next one the game takes. That matches the Windows granter.
+- **How it was found — the script-binder route, which is general.** The engine binds C++ methods to
+  script by instantiating `ScriptBinder<M>` per method *signature*, and each instantiation leaves
+  its own RTTI name in the binary. So `strings | grep ScriptBinderIM27GameInventoryComponentState`
+  lists the class's bound methods **by type**, and one of them reads
+  `EntityState* (GameInventoryComponentState::*)(GlobalIDPointer<content::LootDropItem>, float)` —
+  the signature this section had been searching for by hand. From there:
+  1. `vtable_of('12ScriptBinderIM27GameInventoryComponentStateFPN8coregame11EntityStateEN1r15GlobalIDPointerIN7content12LootDropItemEEEfEE')`
+     → the instantiation's vtable, `0x100e0b970`.
+  2. Whatever stores that vtable is that binder's constructor: `0x100512bc4`. It does
+     `stp x8, x2, [x0]`, i.e. it keeps the bound method's address in `x2`.
+  3. `callers_of(0x100512bc4)` → `0x10051460c`, one call. Read `x2` off the `adrp`/`add` pair that
+     sets it up just above: `0x1004f0bc0`.
+  The whole walk is a handful of `macho.py` calls and one `llvm-objdump`, and it works for any bound
+  method of any class — worth remembering the next time a signature is known but an address is not.
+- **Confirmed in a live game** with `Ap.Control try-unlock item <gid>`: granting a definition the
+  player already held raised that row's quantity, and granting ones they did not add new rows, each
+  carrying the `amount` passed. Both effects survived into the next save.
+- Recorded so it is not re-walked: **`spawnAt`'s three callers are all dead ends** (`0x1003136a4`,
+  `0x1004b4f70`, `0x1005829fc`), and so is `DropLootItem`'s handler at `0x10098782c` — that path
+  spawns at a position, and the give-item path reaches the spawner only as its fallback.
+  `AddToInventoryComponentState`'s vtable (`0x100dd4620`) holds only type-info accessors, and the
+  `m_in_funcAddItem` strings are referenced solely from reflection registration, which gives a field
+  offset rather than a function. None of that mattered in the end; the binder table did it.
+- Below `0x1004f0bc0` are two more useful entry points, if a caller ever wants them:
+  `0x1004c9c18(u32* ownerEntityHandle, GlobalIDPointer*, float)` is the same grant addressed by
+  owner rather than by inventory, and `0x1004f48c4(GlobalID* out, inventory, GlobalIDPointer*)` is
+  the pure "add to inventory, no world spawn" half.
 
-**B. Ability grant**
-- Preferred: the debug page. Find the xref to the string `"Give all ability unlocks + upgrades"`;
-  the button callback iterates upgrades and calls a per-upgrade apply. That per-upgrade function is
-  the point-free apply the Windows client reached through `AbilityTree_FireApplyPin`. Also record
-  `"Remove all ability unlocks + upgrades"` (test/cleanup) and `"Award Ability Points"`.
-- Progress: the xref (`0x100afbe70`) is the page's **construction**, not its callback — it creates a
-  button and stores the handle at `page+0x190` (the neighbouring buttons land at `+0x188`, `+0x198`,
-  `+0x1a0`). The callback is whatever later reads `page+0x190`, which needs the decompiler's
-  data flow rather than a string xref.
-- Cheaper route to try first: `RemoveAllAbilityUpgrades` and `AddAbilityPoints` are in the same RPC
-  dispatch chain as the milestones in C, a few comparisons further along
-  (`AddAbilityPoints` compares at `0x100988010`). Reading those handlers out costs what C cost, and
-  remove-all has to reach the same per-upgrade machinery the apply does.
-- Equivalent: `RemoveAllAbilityUpgrades` sits in the server message manager's script table right
-  next to `UnlockSecondaryWeaponSlot`; the *registration* of that table (a run of `(name, fn)` pairs
-  or sequential register calls — xref `"UnlockSecondaryWeaponSlot"`) gives function pointers for
-  the whole family in one place.
-- Fallback: port the Windows path 1:1 — `FlowConnMgr = *sm_pInstance` (dlsym), `pin = mgr+0xf8`,
-  `AbilityTree_FireApplyPin` located by xref from the menu's ApplyUpgrade worker.
+**B. Ability grant — `ApplyAbilityUpgrade` — FOUND**
+- **`Game+0x87a988`**, the RPC method `UnlockAbilityUpgrade`, called as
+  `(PlayerPropertiesComponentState* this, GlobalID* definition)` and returning nothing. `this` is
+  the same `*(*(Game+0xe68d60) + 0x20)` object the milestones in C use. The argument is the same
+  24-byte `GlobalIDPointer` buffer as A — the handler reads only the GID at +0, but the game's own
+  dispatcher hands it the whole structure, so the client does too.
+- It is a better fit than the debug page this section originally preferred, because it *is* the
+  whole grant: it walks the player's own ability-upgrade instances, resolves each through
+  `r::GlobalIDMap`, matches `entity+0x78` (the archetype GID) against the definition, and fires the
+  ability tree's apply pin — `this+0xf8`, through `r::FlowConnectionManager::sm_pInstance`, at
+  `0x100894f08`. That is exactly what the Windows client assembles by hand out of `FireApplyPin`,
+  the owner lookup and the pin handle, and none of those need mapping here.
+- It calls `coregame::GameHelper::saveGame(role, 0, 0)` itself before returning, so a grant must not
+  save again — the same correction C needed.
+- Consequence worth knowing: an upgrade whose instance the player's tree has not created is simply
+  not applied. That is the same outcome the Windows granter reports as "no live instance exists for
+  the definition", so the behaviour matches rather than merely resembling it.
+- Found by the route C established: `refs_to(find_string('UnlockAbilityUpgrade')[0][0])` →
+  `0x100987dd4`, the dispatcher's comparison, and the handler is the `bl` at the end of that branch.
+  Its mismatch branch falls straight into the next comparison, `RemoveAllAbilityUpgrades`
+  (`0x100987eac` → handler `0x10087c260`), with `AddAbilityPoints` (`0x100988010`) a little further
+  along — the neighbours this section expected to have to read, and did not.
+- **Confirmed in a live game** with `Ap.Control try-unlock ability <gid>` — see below for how,
+  since the Abilities menu is not available early in the story.
+- **How to tell whether it took, without the Abilities screen.** Two independent ways, both cheap:
+  - The function only reaches its `saveGame` *after* the apply pin returns true. A definition that
+    matches no live instance, and a pin that refuses, both branch to the loop's advance and skip it.
+    So the game saving at all is the signal.
+  - The grant lands in the save's `Inventory` chunk as an **ActivePersistingItem** — a `{GID, 0}`
+    pair in the list after the item rows. That is where Control keeps applied ability upgrades, and
+    the GID is the definition GID that was granted, so `dump-save`'s parse (or sixteen lines of
+    Python over `GameInventory`) answers it exactly.
+
+- The debug-page lead is closed as unnecessary, but the finding stands for anyone who returns to it:
+  the xref to `"Give all ability unlocks + upgrades"` (`0x100afbe70`) is the page's **construction**,
+  storing a button handle at `page+0x190`; the callback is whatever later reads that slot.
 
 **C. Milestones (weapon slot + 2 mod slots) — FOUND**
 - There is no name-to-function table. The RPC dispatcher compares an incoming method name against
@@ -452,22 +483,57 @@ save's inventory size, `type ≤ 2` on GameFlow nodes, archetype GID low 14 bits
 entities. Put the confirmed values in the macOS profile record, not in constants.
 
 **Measured, and they do differ** — "usually lays these out identically" did not survive contact with
-`GameInventoryComponentState`. The GameFlow node layout transferred intact, but this class did not:
+`GameInventoryComponentState`. The GameFlow node layout transferred intact, but this class is
+shifted: everything the Windows client reads sits **eight bytes lower**, because the class begins
+with a base that clang lays out eight bytes shorter than MSVC does.
 
 | Field | Windows | macOS 1.34 | How |
 |---|---|---|---|
-| player flag | `0x90` | **`0x45`** | the only bytes set on exactly two objects out of 46 — the two replicas. `0x55`, `0x60` and `0x88` behave identically; which one *means* "is the player" wants a disassembler |
+| player flag | `0x90` | **`0x88`** | four bytes read 1 on exactly the player's two replicas — `0x45`, `0x55`, `0x60`, `0x88` — but only this one is a flag. Reading all 73 live instances shows the rest: `0x45` and `0x55` are byte 1 of two vectors' *capacity*, which is 256 on the player and 16 on everything else, and `0x60` is a third vector's *size*, also 1 on four NPCs. They agree by arithmetic accident. `0x88` belongs to no vector, and is where Windows' `0x90` lands under this class's eight-byte shift |
 | network role | `0x18` | **`0x10`** | the only word in the first 0x200 bytes whose top two bits read 2 or 3 on every instance, with both roles present |
-| item count | `0x48` | **unmapped** | at `0x48` the two replicas disagree and read ≈3.9 billion — the low half of a pointer. A count has no shape of its own, so it is left unmapped rather than guessed; nothing depends on it |
+| item count | `0x48` | **unmapped** | a candidate was tried and rejected, which is recorded below |
 
-Note this is not a uniform shift, so the rest of the class cannot be derived by subtracting 8.
+The shift is not a licence to subtract 8 — `MGR_OFF_PIN` is `0xf8` on both builds, read straight out
+of §4.3-B's handler. It holds within this class, where the flag and the role both land on it.
+Everything else stays a per-field question.
 
-`Ap.Control probe-game --layout [<rtti-name>]` is what produced that table and takes any class, so
-the same method applies to `MGR_OFF_*` on `PlayerPropertiesComponentState` in Phase 3. It compares
-every instance in memory and reports three things: bytes that single out a few objects (flags), words
-whose top two bits read as a network role, and words the player's replicas agree on that are small
-enough to be a count. Objects that stopped carrying the vtable pointer between the sweep and the read
-are dropped — one freed and reused in that gap differs at nearly every offset and buries the signal.
+**The item count is still unmapped, and here is the candidate that failed**, so nobody re-derives it.
+There is a `{pointer, size, capacity}` vector at `+0x38`/`+0x40`/`+0x44`, and the game's own "does
+this inventory already hold that definition" walk iterates it — which looked like the counterpart of
+Windows' `+0x40`/`+0x48`. It is inventory-shaped in memory too: capacity 256 on the player's two
+replicas against 16 on the other seventy objects, non-empty on a handful of NPCs. It is still not the
+item count. It reads **84** on a player whose save holds **9** item rows, and its entries are content
+type **156**, none of them the item definitions the save records. Whatever it counts, it is not what
+`OFF_ITEM_COUNT` counts.
+
+That is the shape of this particular question: a count has no signature in memory and no obvious one
+in the binary either, and two plausible derivations have now both been wrong. Nothing reads it, so it
+stays at zero until something needs it enough to walk the class properly.
+
+Confirmed on the way past, from the game's own code rather than from memory (§4.3-A, §4.3-B):
+
+| Constant | Windows | macOS 1.34 |
+|---|---|---|
+| `GOM_TABLE` (entity pointer array) | `0x310` | `0x310`, and a generation table alongside it at `0x10310` |
+| `ENT_ARCHETYPE_GID` | `0x80` | **`0x78`** |
+| `MGR_OFF_PIN` (ability apply pin) | `0xf8` | `0xf8` |
+| `MGR_OFF_OWNER` | `0x28` | **`0x20`** |
+| `GomRoleOffsets` | `{-8, 0, 8}` off a container | `r::GameObjectManager::sm_instances[0..1]`, indexed by the handle's top bit |
+
+`Ap.Control probe-game --layout [<rtti-name>]` is what produced the first table and takes any class,
+so the same method applies to the rest of `MGR_OFF_*` on `PlayerPropertiesComponentState` if anything
+ever needs them. It compares every instance in memory and reports three things: bytes that single out
+a few objects (flags), words whose top two bits read as a network role, and words the player's
+replicas agree on that are small enough to be a count. Objects that stopped carrying the vtable
+pointer between the sweep and the read are dropped — one freed and reused in that gap differs at
+nearly every offset and buries the signal. What it cannot do is find a field with no shape, which is
+why the item count is still unmapped.
+
+A warning about that tool, earned the hard way: "set on exactly the objects I expect" is weaker
+evidence than it looks. Three of the four bytes it offered for the player flag were fields of an
+adjacent vector whose value happened to be 1, and one of them — `0x45` — was byte 1 of a capacity of
+256. A candidate is worth checking against what it *is* before it is trusted, not only against which
+objects it picks out.
 
 ### 4.5 Profile record (proposal)
 
@@ -479,26 +545,26 @@ MacGameBuildProfile {
   Uuid = "CF65DC88-F5CE-38A4-8A2A-21FD5F43F14B",
 
   // Game image offsets; the runtime slide from `hello` is added on use
-  GiveItemFromDefinition    = 0,          // §4.3-A, not yet found
-  ApplyAbilityUpgrade       = 0,          // §4.3-B, not yet found
-  UnlockSecondaryWeaponSlot = 0x87c51c,   // confirmed in game
-  UnlockCharacterModSlot    = 0x87c57c,   // confirmed in game
-  PlayerPropertiesHolder    = 0xe68d60,   // *(*(base+this) + 0x20) is the object the two are called on
+  GiveItemFromDefinition    = 0x4f0bc0,   // §4.3-A  (this, GlobalIDPointer*, float in s0) -> item
+  ApplyAbilityUpgrade       = 0x87a988,   // §4.3-B  (this, GlobalID*); saves itself
+  UnlockSecondaryWeaponSlot = 0x87c51c,   // §4.3-C  (this);            saves itself
+  UnlockCharacterModSlot    = 0x87c57c,   // §4.3-C  (this, level);     saves itself
+  PlayerPropertiesHolder    = 0xe68d60,   // *(*(base+this) + 0x20) is the object the last three take
 
   // struct layout, measured on this build (§4.4)
-  Inventory = InventoryLayout { IsPlayer = 0x45, NetRole = 0x10, ItemCount = 0 /* unmapped */ },
+  Inventory = InventoryLayout { IsPlayer = 0x88, NetRole = 0x10, ItemCount = 0 /* unmapped */ },
 }
 ```
 
-`MissingAddresses()` reports the zeroes by name, and the startup banner prints them, so a player on
-an unfinished build is told which features do not work rather than left to find out.
+`MissingAddresses()` reports any zeroes by name, and the startup banner prints them, so a player on
+an unfinished build is told which features do not work rather than left to find out. On 1.34 there
+are none left.
 
 Everything symbol- or RTTI-derived is deliberately **not** in the record — the frame pump, `saveGame`,
 the object manager, the flow-connection singleton, and every vtable the scans need. Those are
 resolved at runtime by name and survive a game update untouched. What is in the record is exactly
-what a game update invalidates, which is the list to re-derive with `tools/` when one lands.
-Everything symbol- or RTTI-derived is *not* in the record; it is resolved at runtime and therefore
-survives game updates. `MissingAddresses()` semantics stay as today.
+what a game update invalidates, which is the list to re-derive with `tools/` when one lands, and
+§4.3 records how each was found rather than only what it is.
 
 `InventoryLayout` is in the record but defaulted rather than per-build, because the checks in §4.4
 turned out to be worth more than a table: a candidate has to carry a plausible network role before
@@ -640,7 +706,7 @@ for the rest:
 | `MacPlayerInventory.cs` | finds the player's inventory: RTTI walk, heap sweep, rank by role |
 | `MacPlayerProperties.cs` | finds the object the milestone methods are called on, vtable-checked |
 | `MacLayoutProbe.cs` | compares instances, and diffs one object over time, to locate fields (§4.4) |
-| `MacGranters.cs` | `MacItemGranter` (still unmapped) and `MacAbilityGranter` (milestones work) |
+| `MacGranters.cs` | `MacItemGranter` and `MacAbilityGranter`, both on the game's own methods, plus the shared "put a GID where the game can read it" step |
 
 Deliberately **not** built, each because nothing needed it:
 
@@ -703,20 +769,33 @@ Commands that do exist: `dump-save`, `probe-game`, `try-unlock` (§0.6).
 - RTTI `vtable` op + inventory candidate scan; confirm §4.4 offsets. Done when the player inventory
   object is found and re-found after a save load — which is what `Ap.Control probe-game` prints.
 
-**Phase 3 — Grants (RE-bound) — IN PROGRESS, half done**
+**Phase 3 — Grants (RE-bound) — DONE**
 - Map §4.3 A–D; fill `MacGameBuildProfile`; implement `MacItemGranter`, `MacAbilityGranter`.
 - Done when: an inventory GID grant appears in-game and in the next save; an ability upgrade grant
   shows as bought in the (locked) Abilities menu; progressive milestones add the weapon slot and
   both mod slots; all three survive a reload; the "held until a save is loaded" deferral behaves as
-  on Windows.
-- **Done:** §4.3-C. Both milestone methods found, called in a live game, and both slots appeared.
-  `MacAbilityGranter.GrantMilestoneAsync` grants for real; they are idempotent and self-persisting,
-  so there is no deferral or save to arrange around them.
-- **Remaining:** §4.3-A (`GiveItemFromDefinition`) and §4.3-B (`ApplyAbilityUpgrade`), plus somewhere
-  in the game's address space for the item grant's GID (§3.1). §0.6 has the order to take them in.
-- Two corrections to this plan came out of the half that is done, both recorded where they belong:
-  the milestone methods **save themselves**, so a grant must not save again (§4.3-C); and the
-  mod-slot method takes a **milestone level rather than a slot index**.
+  on Windows. Met, with one substitution: the ability grant was verified in the save rather than in
+  the Abilities menu, which is not reachable early in the story (§4.3-B says how). There is no
+  deferral to check — all four methods are idempotent and three of them save themselves.
+- **Mapped and implemented:** all four addresses (§4.3-A, B, C), the struct offsets they need
+  (§4.4), and the shim's scratch buffer that carries a definition GID into the game (§3.1).
+  `MacItemGranter.GiveItemAsync`, `MacAbilityGranter.GrantAbilityAsync` and `.GrantMilestoneAsync`
+  all call the game's own methods.
+- **Confirmed in a live game, all four:** the milestone methods added both slots; the item grant
+  raised the quantity of a definition already held and added new rows for ones that were not, with
+  the `amount` it was given; the ability grant appeared in the save as an ActivePersistingItem.
+  `try-unlock` is what did each, and it refuses to call anything unless the object carries the right
+  vtable and the pump is ticking.
+- Four corrections to this plan came out of the work, each recorded where it belongs:
+  - the milestone methods and the ability grant **save themselves**, so a grant must not save again
+    (§4.3-B, §4.3-C) — the item grant does not, matching Windows;
+  - the mod-slot method takes a **milestone level rather than a slot index** (§4.3-C);
+  - the item grant's definition argument is a pointer to a 24-byte `GlobalIDPointer`, not to a bare
+    GID, and the amount is a `float` in `s0` (§4.3-A);
+  - `GameInventoryComponentState`'s layout is an **eight-byte** shift from Windows within the class,
+    which §4.4 previously recorded as not uniform because it had the wrong flag offset — and the
+    offset it had was a byte of an adjacent vector's capacity, agreeing with the truth by accident.
+    The item count remains unmapped; a second candidate for it was tried and rejected too (§4.4).
 
 **Phase 4 — Ship (1 day)**
 - CI: add a `macos-latest` job (arm64 runner) that builds the dylib, publishes client + patcher for
@@ -725,8 +804,9 @@ Commands that do exist: `dump-save`, `probe-game`, `try-unlock` (§0.6).
   where logs live). Release notes.
 - `install-launcher` / `--launch` UX polish; startup banner explains what is and is not mapped.
 
-Total: roughly 1.5–2 weeks, dominated by Phase 3 (which is now string/xref work, not blind
-signature hunting).
+Total: roughly 1.5–2 weeks, dominated by Phase 3 — which came in well under that, because every
+address turned out to be reachable from a name the binary still carries rather than by signature
+hunting.
 
 ## 11. Risks and open questions
 
@@ -735,7 +815,7 @@ signature hunting).
 | Steam changes what `%command%` passes to the wrapper (`.app` vs binary) or stops exporting `STEAM_DYLD_INSERT_LIBRARIES` | Wrapper handles both shapes; overlay loss is cosmetic. Client-launch (§5.2) remains as a second path. |
 | Interposing does not bind for a non-libSystem symbol in some dyld version | §3.2 fallbacks (GOT slot rebind); verified cheaply in Phase 0. |
 | Pump does not tick in menus/pause | Identical to Windows; deferred-grant queue already exists; the `pump_state` event lets the UI say "load a save". |
-| ~~clang struct layouts differ from MSVC for one of the touched classes~~ **happened** | Two of `GameInventoryComponentState`'s three fields moved (§4.4). Caught by the confirmation checks rather than by a bad write, and fixed as data. The remaining classes should be assumed to have moved too until measured. |
+| ~~clang struct layouts differ from MSVC for one of the touched classes~~ **happened** | All three of `GameInventoryComponentState`'s fields moved eight bytes, as did two on `PlayerPropertiesComponentState` and the entity archetype GID (§4.4). Caught by the confirmation checks rather than by a bad write, and fixed as data. The remaining classes should be assumed to have moved too until measured — and the shift is not universal, since the ability apply pin is at `0xf8` on both. |
 | Game update ships a new `Game` (new UUID) | dlsym/RTTI parts keep working; only the residual `Game` offsets need re-deriving (one Ghidra session, and the recipes in §4.3 are repeatable). |
 | Save location/container unknown until a save exists; could be Cloud-only or container-wrapped | §7: signature search inside the file; in-process scan fallback via the shim. |
 | Gatekeeper refuses the dylib or the client binary | Embed + write + clear quarantine; ship `.tar.gz`; document `xattr -d`. |
@@ -752,13 +832,15 @@ otool -l "$GAME/Contents/MacOS/Game" | grep -A2 LC_UUID   # profile key
 nm -gU "$GAME/Contents/MacOS/coregame.dylib" | c++filt | grep -i 'saveGame\|DynamicEntitySpawner::update'
 nm -u  "$GAME/Contents/MacOS/Game" | c++filt | grep DynamicEntitySpawner   # proves cross-image call
 strings -n 6 "$GAME/Contents/MacOS/Game" | grep -n 'UnlockSecondaryWeaponSlot\|SetGlobalBoolVariable\|Give all ability'
+strings -n 6 "$GAME/Contents/MacOS/Game" | grep ScriptBinderIM27GameInventory   # a class's bound methods, by signature
 vmmap <pid> | grep libapcontrol                       # is the shim loaded?
 tail -f ~/Library/Logs/Ap.Control/shim.log
 
 make -C native/apshim check                           # shim end to end, no game needed
-Ap.Control probe-game                                 # build, pump, RTTI walk, inventory scan
+Ap.Control probe-game                                 # build, pump, scratch buffer, RTTI walk, inventory scan
 Ap.Control probe-game --layout 30PlayerPropertiesComponentState    # where a class keeps its fields
 Ap.Control try-unlock weapon-slot                     # call a mapped address for real (changes the game)
+Ap.Control try-unlock item 0x<gid>                    # ... including the two not yet confirmed in game
 ```
 
 Reading the binary (`tools/README.md` has the rest):
@@ -768,6 +850,7 @@ cd tools && python3 -i macho.py
 >>> [hex(a) for a in refs_to(find_string('UnlockSecondaryWeaponSlot')[0][0])]   # who mentions it
 >>> vtable_of('27GameInventoryComponentState')                                  # its vtables
 >>> callers_of(list(stubs_for('spawnAt'))[0])                                    # who calls an engine function
+>>> callers_of(0x100512bc4)                                                      # who constructs a script binder
 
 xcrun llvm-objdump --disassemble --start-address=0x10087c51c --stop-address=0x10087c57c "$GAME/Contents/MacOS/Game"
 ```
