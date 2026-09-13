@@ -115,10 +115,14 @@
   ];
 
   var ACTIONS = [
+    { id: "clear", label: function () { return "Clear " + (fieldById(lastField) || { label: "Field" }).label; } },
     { id: "connect", label: "Connect" },
   ];
 
   var editing = null;
+  // Which field "Clear" is about. It has to outlive `editing`, because navigation is suspended
+  // while a field is being edited — reaching the button at all means having stopped editing first.
+  var lastField = null;
   var MAX_FIELD = 64;
 
 
@@ -166,7 +170,7 @@
 
   function setEditing(id) {
     editing = id;
-    if (id) suspendEvents(NAV_EVENTS);
+    if (id) { lastField = id; suspendEvents(NAV_EVENTS); }
     else resumeEvents(NAV_EVENTS);
   }
 
@@ -215,6 +219,10 @@
     return React.createElement(TileTitle, { locId: text, disableLocalisation: true });
   }
 
+  function actionLabel(a) {
+    return typeof a.label === "function" ? a.label() : a.label;
+  }
+
   function apPage() {
     var rows = statusRows().map(function (r, i) {
       return React.createElement("div", { key: "row" + i },
@@ -238,7 +246,7 @@
       children.push(React.createElement("div", { key: "actions", className: "ap-section__actions" },
         ACTIONS.map(function (a) {
           return React.createElement(EventButton,
-            { key: a.id, event: actionEvent(a.id) }, label(a.label));
+            { key: a.id, event: actionEvent(a.id) }, label(actionLabel(a)));
         })));
     }
 
@@ -358,7 +366,10 @@
       ACTIONS.forEach(function (a) {
         a.handler = function () {
           setEditing(null);
-          if (a.id === "connect") {
+          if (a.id === "clear") {
+            var target = fieldById(lastField);
+            if (target) target.value = "";
+          } else if (a.id === "connect") {
             var values = {};
             FIELDS.forEach(function (f) { values[f.id] = f.value; });
             send("action:connect " + JSON.stringify(values));
@@ -436,7 +447,23 @@
   // --- typing --------------------------------------------------------------------------------
 
   var shiftDown = false;
-  var pendingFallback = null;
+  var pending = null;
+
+  // Flip to true to have every key event seen while editing reported to the client's console as
+  // `[ui-js] key ...`. The view has no developer tools, so this is the only way to find out what a
+  // platform actually delivers — which is how the macOS delete key above was pinned down. Capped
+  // so a long session cannot flood the socket.
+  var DEBUG_KEYS = false;
+  var debugBudget = 60;
+
+  function reportKey(e) {
+    if (!DEBUG_KEYS || !editing || debugBudget <= 0) return;
+    debugBudget--;
+    send("error:key " + e.type
+      + " keyCode=" + e.keyCode + " which=" + e.which + " charCode=" + e.charCode
+      + " key=" + JSON.stringify(e.key) + " code=" + JSON.stringify(e.code)
+      + " shift=" + e.shiftKey);
+  }
 
   function insert(f, ch) {
     if (f.digits && (ch < "0" || ch > "9")) return false;
@@ -444,6 +471,27 @@
     f.value += ch;
     refreshMainMenu();
     return true;
+  }
+
+  function erase(f) {
+    if (!f.value.length) return false;
+    f.value = f.value.slice(0, -1);
+    refreshMainMenu();
+    return true;
+  }
+
+  // What the delete key looks like here. The view reports Windows-style virtual key codes and
+  // fills in neither `key` nor `code`, so the code number is all there is to go on — and on macOS
+  // it maps the delete key to VK_DELETE (46) rather than VK_BACK (8), with no keypress following,
+  // unlike a letter. Accept both codes: these fields have no cursor, so a forward delete has
+  // nothing else it could mean. No printable key reports either code (`.` is 190 / 110).
+  function isErase(e) {
+    var kc = e.keyCode || e.which || 0;
+    return kc === 8 || kc === 46;
+  }
+
+  function isShift(e) {
+    return (e.keyCode || e.which || 0) === 16;
   }
 
   function fallbackChar(e) {
@@ -462,45 +510,60 @@
     return null;
   }
 
-  function scheduleFallback(f, ch) {
+  // keydown and keypress describe the same keystroke, and only keypress knows which character the
+  // layout and modifiers actually produced — but not every key gets one (the delete key does not).
+  // So keydown never acts directly, it *schedules* its own coarser reading for the next turn of the
+  // event loop, and a keypress, dispatched first, cancels it. Keys that produce a keypress are
+  // handled by the handler that knows best; keys that do not still act, one turn later; and no
+  // keystroke is ever applied twice.
+  function schedule(apply) {
     var token = { used: false };
-    pendingFallback = token;
+    pending = token;
     setTimeout(function () {
       if (token.used) return;
-      if (pendingFallback === token) pendingFallback = null;
-      insert(f, ch);
+      if (pending === token) pending = null;
+      apply();
     }, 0);
   }
 
+  function consumePending() {
+    if (!pending) return;
+    pending.used = true;
+    pending = null;
+  }
+
   function onKeyDown(e) {
-    if (e.keyCode === 16) shiftDown = true;
+    if (isShift(e)) shiftDown = true;
+    reportKey(e);
     if (!editing) return;
     var f = fieldById(editing);
     if (!f) return;
 
-    if (e.keyCode === 8) {
-      f.value = f.value.slice(0, -1);
-      refreshMainMenu();
+    if (isErase(e)) {
+      schedule(function () { erase(f); });
       return;
     }
 
     var ch = fallbackChar(e);
-    if (ch) scheduleFallback(f, ch);
+    if (ch) schedule(function () { insert(f, ch); });
   }
 
   function onKeyUp(e) {
-    if (e.keyCode === 16) shiftDown = false;
+    if (isShift(e)) shiftDown = false;
+    reportKey(e);
   }
 
   function onKeyPress(e) {
-    if (pendingFallback) { pendingFallback.used = true; pendingFallback = null; }
+    consumePending();
+    reportKey(e);
 
     if (!editing) return;
     var f = fieldById(editing);
     if (!f) return;
 
     var code = e.charCode || e.which || 0;
-    if (code < 32 || code === 127) return
+    if (code === 127 || isErase(e)) { erase(f); return; }
+    if (code < 32) return;
     var ch = String.fromCharCode(code);
 
     if (shiftDown || e.shiftKey) {
