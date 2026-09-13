@@ -44,8 +44,11 @@ Phases 0, 1 and 2 are built and on the `macos-port` branch. What runs today:
   `MacPlayerInventory` sweeps the heap for the player's inventory and picks the authoritative
   replica. Confirmed against the running game — 46 inventory objects, two of them the player's,
   roles 3 and 2, re-found after a reload. `Ap.Control probe-game` prints each step.
-- **Not yet**: inventory items and ability upgrades, which need §4.3's reverse engineering. The
-  profile holds zeroes rather than guesses and the granters say which feature is unmapped.
+- **Progressive milestones work** — the extra weapon slot and both mod slots. Phase 3 found the
+  game's own methods for them (§4.3-C) and confirmed them by calling them in a live game.
+- **Not yet**: inventory items and ability upgrades, which need the remaining two addresses in
+  §4.3-A and §4.3-B. The profile holds zeroes rather than guesses and the granters say which
+  feature is unmapped.
 
 Four things came out differently from the design below, all deliberate:
 1. **Requests are whitespace-separated tokens, not JSON** (responses are still JSON). Every argument
@@ -317,16 +320,20 @@ intact (Ghidra's "RTTI Analyzer" / class recovery names the vtables for you).
   | method | handler | call |
   |---|---|---|
   | `UnlockSecondaryWeaponSlot` | `0x10087c51c` | `(this)` |
-  | `UnlockCharacterModSlot` | `0x10087c57c` | `(this, int slot)`, slot parsed from the params |
+  | `UnlockCharacterModSlot` | `0x10087c57c` | `(this, uint level)` |
 
   `this` is `*(*(0x100e68d60) + 0x20)` — the dispatcher's own route to the player-properties
   object. `0x100e68d60` is in `__DATA,__common`, so it is filled in at runtime, not on disk.
-- Both read as the right functions: the first checks a tweakable against a counter at `this+0x44`
-  and returns early at the cap; the second clamps its argument to 0..3 and compares `this+0x48`
-  against two tweakables. The first also reads the network role at `this+0x10`, independently
-  confirming §4.4's measured offset on a different class. They sit 0x60 apart — adjacent methods.
-- **Not yet called.** The disassembly says what they are; an in-game grant says they work.
-- Verify persistence: the Windows path called `saveGame` afterwards; keep doing that.
+- **Confirmed in a live game** with `Ap.Control try-unlock`: both returned after one pump beat and
+  both slots appeared. The client's milestone grant is implemented on them.
+- The mod-slot argument is the **milestone level, not a slot index**. The method reads the level the
+  player already has and acts only when asked for more, so levels 2 and 3 are simply passed through.
+  Both methods are idempotent for the same reason, which makes a repeated progressive item harmless.
+- **Neither needs a save afterwards**: both call `coregame::GameHelper::saveGame(role, 0, 0)`
+  themselves before returning. The Windows path had to save separately; this one must not, and the
+  instruction that used to be here was wrong for this build.
+- `UnlockSecondaryWeaponSlot` also reads the network role at `this+0x10`, independently confirming
+  §4.4's measured offset from the game's own code, on a different class.
 
 **D. GameFlow flags / clearance (`KEY1..KEY6`, sector `*_CanTravel_*` bools)**
 - Semantic path: `SetGlobalBoolVariable` from the same tables (its neighbours are

@@ -139,7 +139,16 @@ namespace Ap.Control.Memory.Mac
     /// </summary>
     internal sealed class MacAbilityGranter : MacGranterBase, IAbilityGranter
     {
-        internal MacAbilityGranter(ShimClient? shim = null) : base(shim) { }
+        /// <summary>Highest milestone level the interface defines.</summary>
+        private const int MaxLevel = 3;
+
+        private readonly MacPlayerProperties _properties;
+
+        internal MacAbilityGranter(ShimClient? shim = null) : base(shim)
+            => _properties = new MacPlayerProperties(Shim);
+
+        // IsReady stays the base's: it requires every address the granter needs, and ability
+        // upgrades are still unmapped. Milestones working is not the granter being ready.
 
         public Task StartAsync(CancellationToken cancellationToken = default)
         {
@@ -153,10 +162,59 @@ namespace Ap.Control.Memory.Mac
                 WhyNot(p => p.ApplyAbilityUpgrade, "ability upgrades")
                 ?? "the ability-tree manager has not been located on macOS yet."));
 
-        public Task<GrantResult> GrantMilestoneAsync(int level,
+        /// <summary>
+        /// Grant a milestone by calling the game's own method for it.
+        ///
+        /// Simpler than the Windows path, which has to raise a spent-points high-water mark past a
+        /// threshold and fire a reward pin. Here both methods exist as functions, and both are
+        /// idempotent: each checks what the player already has and returns without doing anything
+        /// when the level is already reached, so a repeated progressive item is harmless.
+        ///
+        /// Neither needs a save afterwards — both call <c>GameHelper::saveGame</c> themselves
+        /// before returning, which is visible in their disassembly and is why this does not.
+        /// </summary>
+        public async Task<GrantResult> GrantMilestoneAsync(int level,
             CancellationToken cancellationToken = default)
-            => Task.FromResult(GrantResult.Fail(
-                WhyNot(p => p.UnlockSecondaryWeaponSlot, "ability-point milestones")
-                ?? "the player properties object has not been located on macOS yet."));
+        {
+            if (level is < 1 or > MaxLevel)
+                return GrantResult.Fail($"milestone level {level} out of range (1..{MaxLevel})");
+
+            // Level 1 is the weapon slot; 2 and 3 are the mod slots, and the mod-slot method takes
+            // the level itself rather than a slot index — it acts only when asked for more than the
+            // player has.
+            if (WhyNot(p => level == 1 ? p.UnlockSecondaryWeaponSlot : p.UnlockCharacterModSlot,
+                    "ability-point milestones") is { } reason)
+                return GrantResult.Fail(reason);
+
+            if (Profile() is not { } profile) return GrantResult.Fail("the build is not mapped.");
+
+            ulong gameBase = GameBase();
+            MacPlayerProperties.Located found =
+                _properties.Locate(profile, gameBase, profile.Inventory);
+            if (found.Problem is { } problem) return GrantResult.Fail(problem);
+
+            if (Shim.Pump() is { Ticking: false })
+                return GrantResult.Fail(
+                    "the game is not running frames — the grant will be retried once it is.");
+
+            (long offset, ulong[] arguments) = level == 1
+                ? (profile.UnlockSecondaryWeaponSlot, new[] { (ulong)found.Address })
+                : (profile.UnlockCharacterModSlot, new[] { (ulong)found.Address, (ulong)level });
+
+            // What the object looked like before, so the outcome can be reported as more than
+            // "the call returned". Both methods leave it alone when the level is already held.
+            byte[] before = Shim.Read(found.Address, 0x60);
+
+            ShimCall call = await Task.Run(
+                () => Shim.Call(gameBase + (ulong)offset, arguments, []), cancellationToken)
+                .ConfigureAwait(false);
+
+            if (!call.Ok) return GrantResult.Fail(call.Error ?? "the call did not complete");
+
+            byte[] after = Shim.Read(found.Address, 0x60);
+            bool changed = before.Length == after.Length && !before.AsSpan().SequenceEqual(after);
+
+            return new GrantResult { Ok = true, Accepted = changed };
+        }
     }
 }

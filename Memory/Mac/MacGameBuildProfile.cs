@@ -152,17 +152,17 @@ namespace Ap.Control.Memory.Mac
             ApplyAbilityUpgrade = 0,
 
             // Read out of the game's own RPC dispatcher, which compares an incoming method name
-            // against each it knows and calls the handler inline. Identified statically and NOT yet
-            // called: the disassembly says what they are, an in-game grant says they work.
+            // against each it knows and calls the handler inline. Confirmed by calling both in a
+            // live game and watching the slots appear.
             //
-            //   UnlockSecondaryWeaponSlot  checks a tweakable against a counter at this+0x44,
-            //                              returns early when already at the cap, and reads the
-            //                              network role at this+0x10 — the same offset the
-            //                              inventory scan measured, on a different class.
-            //   UnlockCharacterModSlot     clamps its argument to 0..3 and compares a counter at
-            //                              this+0x48 against two tweakables.
+            //   UnlockSecondaryWeaponSlot(this)        takes no argument.
+            //   UnlockCharacterModSlot(this, level)    takes the milestone LEVEL, not a slot index:
+            //                                          it works out what the player has and acts
+            //                                          only when asked for more.
             //
-            // They sit 0x60 apart, which is what adjacent methods on one class look like.
+            // Both are idempotent, and both call GameHelper::saveGame themselves before returning,
+            // so a grant needs no save of its own. They sit 0x60 apart, which is what adjacent
+            // methods on one class look like.
             UnlockSecondaryWeaponSlot = 0x87c51c,
             UnlockCharacterModSlot = 0x87c57c,
             PlayerPropertiesHolder = 0xe68d60,
